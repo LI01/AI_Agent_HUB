@@ -146,6 +146,11 @@ class AccessControl:
 
     def ensure_bootstrap_admin(self):
         if db.list_api_keys():
+            print(
+                "[auth] DB already has API keys; bootstrap skipped. "
+                "If you've lost the seed admin key, delete the DB or "
+                "set AGENT_HUB_ADMIN_KEY to a known value before next start."
+            )
             return
 
         env_key = os.getenv("AGENT_HUB_ADMIN_KEY")
