@@ -240,3 +240,70 @@ def test_p2_del_8_sdk_no_deadlock_sync(hub_server):
         sdk_b.stop()
         t_a.join(timeout=2)
         t_b.join(timeout=2)
+
+
+# === P2.3 polish — unregister_on_stop flag ===
+
+@pytest.mark.skipif(
+    not _hub_supports_submit_child(),
+    reason="hub-side handler is Unit C's deliverable; integration tests deferred",
+)
+def test_p23_unregister_on_stop_true_removes_agent_from_registry(hub_server):
+    """When unregister_on_stop=True, stop() POSTs /unregister; agent row gone."""
+    import threading
+    import time
+    from agent_sdk.client import AgentHub
+
+    base_url, ws_url = hub_server
+    key = _make_key(base_url, "uos-true", can_register=True, can_view_agents=True)
+    headers = {"Authorization": f"Bearer {key}"}
+
+    sdk = AgentHub(
+        hub_url=base_url, agent_id="uos-true-agent",
+        capabilities=["echo"], auth_token=key, task_handler=lambda t: {},
+        reconnect=False, unregister_on_stop=True,
+    )
+    t = threading.Thread(target=sdk.start, daemon=True)
+    t.start()
+    time.sleep(0.5)
+
+    r = httpx.get(f"{base_url}/agents/uos-true-agent", headers=headers)
+    assert r.status_code == 200, "agent should be registered after start"
+
+    sdk.stop()
+    t.join(timeout=2)
+
+    r = httpx.get(f"{base_url}/agents/uos-true-agent", headers=headers)
+    assert r.status_code == 404, "agent should be unregistered (row deleted) after stop"
+
+
+@pytest.mark.skipif(
+    not _hub_supports_submit_child(),
+    reason="hub-side handler is Unit C's deliverable; integration tests deferred",
+)
+def test_p23_unregister_on_stop_false_leaves_agent_offline(hub_server):
+    """Default (unregister_on_stop=False): stop() only closes WS; agent row stays as offline."""
+    import threading
+    import time
+    from agent_sdk.client import AgentHub
+
+    base_url, ws_url = hub_server
+    key = _make_key(base_url, "uos-false", can_register=True, can_view_agents=True)
+    headers = {"Authorization": f"Bearer {key}"}
+
+    sdk = AgentHub(
+        hub_url=base_url, agent_id="uos-false-agent",
+        capabilities=["echo"], auth_token=key, task_handler=lambda t: {},
+        reconnect=False,  # default unregister_on_stop=False
+    )
+    t = threading.Thread(target=sdk.start, daemon=True)
+    t.start()
+    time.sleep(0.5)
+
+    sdk.stop()
+    t.join(timeout=2)
+    time.sleep(0.3)  # let hub process disconnect
+
+    r = httpx.get(f"{base_url}/agents/uos-false-agent", headers=headers)
+    assert r.status_code == 200, "agent row should still exist (default behavior)"
+    assert r.json()["status"] == "offline"

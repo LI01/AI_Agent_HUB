@@ -45,6 +45,7 @@ class AgentHub:
         auth_token: Optional[str] = None,
         task_handler: Optional[Callable] = None,
         reconnect: bool = True,
+        unregister_on_stop: bool = False,
     ):
         self.hub_url = hub_url.rstrip("/")
         self.ws_url = self.hub_url.replace("http://", "ws://").replace("https://", "wss://")
@@ -53,6 +54,7 @@ class AgentHub:
         self.auth_token = auth_token
         self._task_handler = task_handler
         self.reconnect = reconnect
+        self.unregister_on_stop = unregister_on_stop
         self._running = False
         self._ws = None
 
@@ -324,6 +326,8 @@ class AgentHub:
 
     def stop(self):
         self._running = False
+        if self.unregister_on_stop:
+            self._unregister_best_effort()
         if self._ws:
             self._ws.close()
         try:
@@ -332,6 +336,20 @@ class AgentHub:
             # Python <3.9 fallback (no cancel_futures kwarg).
             self._executor.shutdown(wait=False)
         print(f"Agent {self.agent_id} stopped")
+
+    def _unregister_best_effort(self):
+        # REST POST /unregister?agent_id=<id>. Best-effort: a hub that's
+        # already gone shouldn't prevent local shutdown.
+        import httpx
+        try:
+            httpx.post(
+                f"{self.hub_url}/unregister",
+                params={"agent_id": self.agent_id},
+                headers={"Authorization": f"Bearer {self.auth_token}"} if self.auth_token else {},
+                timeout=2.0,
+            )
+        except Exception as exc:
+            print(f"[agent_sdk] unregister failed (ignored): {exc}")
 
     def send_log(self, task_id: str, log: str):
         self._send_json({"type": "log", "task_id": task_id, "log": log})
@@ -345,6 +363,7 @@ class AsyncAgentHub:
         capabilities: list[str],
         auth_token: Optional[str] = None,
         task_handler: Optional[Callable] = None,
+        unregister_on_stop: bool = False,
     ):
         self.hub_url = hub_url.rstrip("/")
         self.ws_url = self.hub_url.replace("http://", "ws://").replace("https://", "wss://")
@@ -352,6 +371,7 @@ class AsyncAgentHub:
         self.capabilities = capabilities
         self.auth_token = auth_token
         self._task_handler = task_handler
+        self.unregister_on_stop = unregister_on_stop
         self._ws = None
 
         # Phase 2 §2.2.6: send-side serialization + pending-wait maps.
@@ -380,6 +400,27 @@ class AsyncAgentHub:
     async def send(self, msg: dict):
         async with self._send_lock:
             await self._ws.send(json.dumps(msg))
+
+    async def stop(self):
+        if self.unregister_on_stop:
+            await self._unregister_best_effort()
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+
+    async def _unregister_best_effort(self):
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as http:
+                await http.post(
+                    f"{self.hub_url}/unregister",
+                    params={"agent_id": self.agent_id},
+                    headers={"Authorization": f"Bearer {self.auth_token}"} if self.auth_token else {},
+                )
+        except Exception as exc:
+            print(f"[agent_sdk] unregister failed (ignored): {exc}")
 
     async def recv(self) -> dict:
         return json.loads(await self._ws.recv())

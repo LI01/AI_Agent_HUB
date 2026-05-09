@@ -273,6 +273,23 @@ agent → hub: {"type":"result","task_id":"...","status":"completed","result":{.
 
 The hub verifies that an agent reporting a result is the agent the task was assigned to. Trying to report someone else's task → `403`.
 
+### 2.6.5 Unregistering on shutdown
+
+By default `agent.stop()` just closes the WebSocket — the hub marks the agent `offline` and the row stays in `GET /agents` indefinitely. For ephemeral agents (per-PR CI runners, one-shot scrape jobs) you usually want the row gone:
+
+```python
+agent = AgentHub(
+    hub_url="http://localhost:8080",
+    agent_id="ci-runner-abc",
+    capabilities=["ci"],
+    auth_token="<key>",
+    task_handler=...,
+    unregister_on_stop=True,   # POST /unregister before closing the WS
+)
+```
+
+Best-effort: if the hub is unreachable at shutdown, `stop()` logs the error and continues. Same flag exists on `AsyncAgentHub` (`await sdk.stop()`).
+
 ### 2.7 Reconnect behavior
 
 If your agent reconnects with the same `agent_id` while a previous WebSocket is still tracked, the hub closes the old socket with code `4000` ("agent reconnected") and accepts the new one. Any in-flight task on the dropped socket is re-queued and will be dispatched again.
