@@ -77,11 +77,17 @@ def _build_claude_cmd(
     Set `AGENT_HUB_CLAUDE_BARE=1` to also pass `--bare` for hermetic runs
     (skips hooks, auto-memory, CLAUDE.md auto-discovery, and **keychain
     reads** — requires `ANTHROPIC_API_KEY` or `apiKeyHelper`).
+    Set `AGENT_HUB_CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS=1` to add
+    `--dangerously-skip-permissions` so Edit/Write/Bash tools fire
+    autonomously in -p mode (required for coder/tester roles; the
+    default `-p` rejects tool use without interactive confirmation).
     `--append-system-prompt` is omitted when `role_prompt` is None.
     """
     cmd: list[str] = ["claude", "-p"]
     if os.environ.get("AGENT_HUB_CLAUDE_BARE") == "1":
         cmd.append("--bare")
+    if os.environ.get("AGENT_HUB_CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS") == "1":
+        cmd.append("--dangerously-skip-permissions")
     cmd += ["--output-format", "json", "--add-dir", str(workdir)]
     if role_prompt is not None:
         cmd += ["--append-system-prompt", role_prompt]
