@@ -1,5 +1,6 @@
 """Unit tests — test_plan.md §2."""
 import json
+import pathlib
 import sys
 import uuid
 
@@ -1747,3 +1748,513 @@ def test_p23_unit_close_remote_only_no_purge(tmp_path, monkeypatch):
     assert rep.get("purge_skipped_process_still_alive_or_untrusted_path") is True
     # local is None -> terminated branch in design §2.3.
     assert rep.get("terminated") is True
+
+
+# === Phase 2.4 FR-FILES — clients/_files.py shared helper ================
+#
+# Design ref: design/phase2.4/design_v3.md §6 (delegates to v2 §6 with v3
+# replacement of FR-FILES-6c). Tests cover the helper surface only;
+# adapter/skill integration tests live with their respective coders.
+
+def test_p24_unit_validate_happy():
+    """FR-FILES-1: valid two-file payload validates without raising."""
+    from clients._files import validate_files
+    validate_files([
+        {"path": "a.py", "content": "x\n"},
+        {"path": "sub/b.py", "content": "y\n"},
+    ])
+
+
+@pytest.mark.parametrize("bad_path,expected_reasons", [
+    ("../escape",         {"path_traversal"}),
+    ("a/../b",            {"path_traversal"}),
+    ("/etc/passwd",       {"path_absolute", "path_traversal"}),
+    ("",                  {"missing_path"}),
+    ("..",                {"path_traversal"}),
+    ("a//b",              {"path_traversal"}),
+    ("a/",                {"path_traversal"}),
+])
+def test_p24_unit_validate_path_traversal(bad_path, expected_reasons):
+    """FR-FILES-2: traversal/absolute/empty rejected by _validate_relpath.
+
+    Note: ``./x`` is intentionally NOT rejected — `PurePosixPath` normalizes
+    a leading ``./`` away before we see the parts, so it lands as the
+    same as ``x``. The user-prompt for this unit notes "./x if rejected
+    by `_validate_relpath`", so we omit it from the parametrize set.
+    """
+    from clients._files import validate_files, InvalidPayloadFiles
+    with pytest.raises(InvalidPayloadFiles) as ei:
+        validate_files([{"path": bad_path, "content": "x"}])
+    assert ei.value.reason in expected_reasons, (
+        f"path={bad_path!r} got reason={ei.value.reason!r}, "
+        f"expected one of {expected_reasons}"
+    )
+
+
+@pytest.mark.parametrize("bad_path,expected_reasons", [
+    (r"a\..\escape",      {"path_traversal"}),
+    (r"dir\file.py",      {"path_traversal"}),
+    ("C:\\windows\\foo",  {"path_traversal", "path_absolute"}),
+])
+def test_p24_unit_validate_windows_backslash(bad_path, expected_reasons):
+    """FR-FILES-9 (validate side): Windows separators / drive prefix rejected."""
+    from clients._files import validate_files, InvalidPayloadFiles
+    with pytest.raises(InvalidPayloadFiles) as ei:
+        validate_files([{"path": bad_path, "content": "x"}])
+    assert ei.value.reason in expected_reasons, (
+        f"path={bad_path!r} got reason={ei.value.reason!r}"
+    )
+
+
+def test_p24_unit_validate_oversized_file():
+    """FR-FILES-3: single content > MAX_FILE_BYTES UTF-8 raises file_too_large."""
+    from clients._files import (
+        validate_files, InvalidPayloadFiles, MAX_FILE_BYTES,
+    )
+    big = "a" * (MAX_FILE_BYTES + 1)
+    with pytest.raises(InvalidPayloadFiles) as ei:
+        validate_files([{"path": "big.txt", "content": big}])
+    assert ei.value.reason == "file_too_large"
+
+
+def test_p24_unit_validate_oversized_total():
+    """FR-FILES-4: 6×900 KiB sum > MAX_TOTAL_BYTES raises total_too_large.
+
+    Each individual file (~900 KiB) is under MAX_FILE_BYTES, so this
+    exercises only the cumulative cap, not the per-file cap.
+    """
+    from clients._files import (
+        validate_files, InvalidPayloadFiles,
+        MAX_FILE_BYTES, MAX_TOTAL_BYTES,
+    )
+    chunk = "a" * (900 * 1024)
+    assert len(chunk.encode("utf-8")) < MAX_FILE_BYTES
+    files = [{"path": f"f{i}.txt", "content": chunk} for i in range(6)]
+    assert sum(len(f["content"].encode("utf-8")) for f in files) > MAX_TOTAL_BYTES
+    with pytest.raises(InvalidPayloadFiles) as ei:
+        validate_files(files)
+    assert ei.value.reason == "total_too_large"
+
+
+def test_p24_unit_validate_reserved_name():
+    """FR-FILES-10g: `.opencode-session-started` is a reserved name."""
+    from clients._files import validate_files, InvalidPayloadFiles
+    with pytest.raises(InvalidPayloadFiles) as ei:
+        validate_files([
+            {"path": ".opencode-session-started", "content": "x"}
+        ])
+    # Design §2.2 lists the reason as `path_reserved`. Spec for this unit
+    # also accepts `reserved_name` as a synonym for backward-compat — but
+    # the helper emits `path_reserved` (matching v2 §2.3 verbatim).
+    assert ei.value.reason in {"path_reserved", "reserved_name"}
+
+
+def test_p24_unit_materialize_nested_paths(tmp_path):
+    """FR-FILES-5a: nested paths create intermediate directories."""
+    from clients._files import materialize_files
+    materialize_files(tmp_path, [
+        {"path": "a/b/c/x.py", "content": "hi\n"},
+    ])
+    assert (tmp_path / "a" / "b" / "c" / "x.py").read_text() == "hi\n"
+
+
+def test_p24_unit_materialize_symlink_parent_escape(tmp_path):
+    """FR-FILES-5b: pre-planted parent symlink rejected before any mkdir.
+
+    Setup: tmp_path/trap is a symlink to outside (a sibling dir).
+    Materializing path=trap/sub/x must raise path_escapes AND must not
+    have created `outside/sub` on disk.
+    """
+    from clients._files import materialize_files, InvalidPayloadFiles
+    outside = tmp_path.parent / (tmp_path.name + "_outside")
+    outside.mkdir()
+    try:
+        (tmp_path / "trap").symlink_to(outside)
+        with pytest.raises(InvalidPayloadFiles) as ei:
+            materialize_files(
+                tmp_path,
+                [{"path": "trap/sub/x", "content": "z"}],
+            )
+        assert ei.value.reason == "path_escapes"
+        assert (outside / "sub").exists() is False, (
+            "parent-chain symlink escape created outside/sub on disk"
+        )
+    finally:
+        # Best-effort cleanup of the sibling outside dir.
+        import shutil
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+def test_p24_unit_readback_partial(tmp_path):
+    """FR-FILES-6a: present file -> files; missing file -> missing list."""
+    from clients._files import readback_files
+    (tmp_path / "a.py").write_text("hello\n", encoding="utf-8")
+    files, missing, truncated = readback_files(tmp_path, ["a.py", "b.py"])
+    assert files == [{"path": "a.py", "content": "hello\n"}]
+    assert missing == ["b.py"]
+    assert truncated == []
+
+
+def test_p24_unit_readback_total_too_large(tmp_path):
+    """FR-FILES-6c (v3 verbatim): total-cap branch isn't preempted by per-file cap.
+
+    Six 900 KiB UTF-8 text files each fit under MAX_FILE_BYTES (1 MiB).
+    Cumulative total exceeds MAX_TOTAL_BYTES (5 MiB) at the sixth file.
+    A small `tail.txt` after that must still be returned in `files`
+    (continue semantics — codex Q3).
+    """
+    from clients._files import (
+        readback_files, MAX_FILE_BYTES, MAX_TOTAL_BYTES,
+    )
+    chunk = "a" * (900 * 1024)
+    assert len(chunk.encode("utf-8")) < MAX_FILE_BYTES
+    names = [f"f{i}.txt" for i in range(6)]
+    for n in names:
+        (tmp_path / n).write_text(chunk, encoding="utf-8")
+    (tmp_path / "tail.txt").write_text("tail\n", encoding="utf-8")
+
+    files, missing, truncated = readback_files(
+        tmp_path, names + ["tail.txt"],
+    )
+    returned_paths = [f["path"] for f in files]
+    assert names[:5] == returned_paths[:5], (
+        f"expected first 5 of {names} in files, got {returned_paths}"
+    )
+    assert "tail.txt" in returned_paths, (
+        "small later file should still fit and be returned"
+    )
+    assert missing == []
+    truncated_paths = {t["path"] for t in truncated}
+    assert names[5] in truncated_paths
+    sixth = next(t for t in truncated if t["path"] == names[5])
+    assert sixth["reason"] == "total_too_large"
+    assert sixth["cap"] == MAX_TOTAL_BYTES
+    assert "size" in sixth
+
+
+# === Phase 2.4 Unit B — agent-tasks skill --file / --expect-back =========
+#
+# Design ref: design/phase2.4/design_v2.md §4 (UX) + §6 FR-FILES-7.
+# Coverage: _parse_file_flags happy path + error branches, and the
+# main()-side payload merge logic for both --file and --expect-back.
+
+
+def test_p24_unit_skill_file_flag_embeds(tmp_path):
+    """FR-FILES-7 (helper side): _parse_file_flags reads UTF-8 local files
+    into payload.files entries. Missing local file raises FileNotFoundError;
+    binary local file raises UnicodeDecodeError (codex Q-answer #2 — no
+    silent base64)."""
+    tasks = _load_tasks_module()
+
+    # Happy path: write "hello" then parse a single --file flag.
+    local = tmp_path / "plan.md"
+    local.write_text("hello", encoding="utf-8")
+    out = tasks._parse_file_flags([f"plan.md={local}"])
+    assert out == [{"path": "plan.md", "content": "hello"}]
+
+    # Missing local file -> FileNotFoundError propagates.
+    with pytest.raises(FileNotFoundError):
+        tasks._parse_file_flags([f"plan.md={tmp_path / 'missing.txt'}"])
+
+    # Binary file -> UnicodeDecodeError propagates (no silent base64).
+    binary = tmp_path / "binary.bin"
+    binary.write_bytes(b"\xff\xfe")
+    with pytest.raises(UnicodeDecodeError):
+        tasks._parse_file_flags([f"data.bin={binary}"])
+
+
+def test_p24_unit_skill_payload_merge(tmp_path):
+    """FR-FILES-7 (merge side): exercise the payload-assembly merge logic
+    directly. --file appends to an existing payload.files list; --expect-back
+    populates payload.expect_files_back. MERGE semantics per design §4.3."""
+    tasks = _load_tasks_module()
+
+    # Stand up the helper input the way main() would.
+    local_b = tmp_path / "b.txt"
+    local_b.write_text("b", encoding="utf-8")
+    extra_files = tasks._parse_file_flags([f"b={local_b}"])
+    assert extra_files == [{"path": "b", "content": "b"}]
+
+    # Starting payload already has a files list (as if --payload supplied it).
+    payload = {"prompt": "x", "files": [{"path": "a", "content": "a"}]}
+
+    # Mirror the main() merge block: list-extend on existing list.
+    existing = payload.get("files")
+    assert isinstance(existing, list)
+    payload["files"] = existing + extra_files
+
+    # --expect-back ["a"] with no existing key -> set as a new list.
+    expect_back_args = ["a"]
+    existing_eb = payload.get("expect_files_back")
+    assert existing_eb is None
+    payload["expect_files_back"] = list(expect_back_args)
+
+    assert payload["files"] == [
+        {"path": "a", "content": "a"},
+        {"path": "b", "content": "b"},
+    ]
+    assert payload["expect_files_back"] == ["a"]
+
+
+def test_p24_unit_codex_materialize_then_readback(tmp_path, monkeypatch):
+    """Codex adapter integration (design v2 §3 verbatim block):
+    payload.files materializes BEFORE subprocess; expect_files_back
+    reads back AFTER success. Mock subprocess.run with a side effect
+    that writes <workdir>/output.py to simulate codex generating a file.
+    """
+    from clients.codex import llm_agent as cx
+
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    class _CP:
+        def __init__(self, stdout, returncode=0, stderr=""):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def fake_run(cmd, capture_output, text, timeout, cwd):
+        # Materialization MUST have happened before subprocess starts.
+        input_path = pathlib.Path(cwd) / "input.py"
+        assert input_path.exists(), (
+            "materialize_files must run BEFORE subprocess.run"
+        )
+        assert input_path.read_text(encoding="utf-8") == "existing"
+        # Side effect: simulate codex writing a generated file.
+        (pathlib.Path(cwd) / "output.py").write_text(
+            "# generated", encoding="utf-8"
+        )
+        return _CP("[assistant]: did the work\n", returncode=0)
+
+    monkeypatch.setattr(cx.subprocess, "run", fake_run)
+
+    class _FakeHub:
+        def send_activity_log(self, *a, **kw):
+            pass
+
+    task = {
+        "task_id": "t1",
+        "timeout": 30,
+        "payload": {
+            "prompt": "edit",
+            "files": [{"path": "input.py", "content": "existing"}],
+            "expect_files_back": ["input.py", "output.py"],
+        },
+    }
+
+    result = cx._run_cli_for_task(
+        task, workdir, role_prompt=None, budget=None,
+        role="coder", hub=_FakeHub(),
+    )
+
+    # Materialization happened before subprocess.
+    assert (workdir / "input.py").read_text(encoding="utf-8") == "existing"
+
+    # Parsed assistant text.
+    assert result["text"] == "did the work"
+    assert result["cli"] == "codex"
+    assert result["role"] == "coder"
+
+    # Readback returned both files.
+    assert "files" in result
+    by_path = {f["path"]: f["content"] for f in result["files"]}
+    assert by_path == {
+        "input.py": "existing",
+        "output.py": "# generated",
+    }
+    assert "files_missing" not in result
+    assert "files_truncated" not in result
+
+
+def test_p24_unit_opencode_materialize_then_readback(tmp_path, monkeypatch):
+    """Opencode adapter (design v2 §3.3): payload.files materializes
+    BEFORE subprocess; expect_files_back reads back AFTER success.
+    Mock subprocess.run with a side effect that writes <workdir>/result.txt
+    to simulate the opencode CLI producing a file. Stdout is JSONL so the
+    parser returns the assistant text.
+    """
+    from clients.opencode import llm_agent as oc
+
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    class _CP:
+        def __init__(self, stdout, returncode=0, stderr=""):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def fake_run(cmd, capture_output, text, timeout, cwd):
+        # Side effect: simulate opencode writing a result file.
+        (workdir / "result.txt").write_text("done", encoding="utf-8")
+        return _CP('{"role": "assistant", "content": "done"}\n', returncode=0)
+
+    monkeypatch.setattr(oc.subprocess, "run", fake_run)
+
+    class _FakeHub:
+        def send_activity_log(self, *a, **kw):
+            pass
+
+    task = {
+        "task_id": "t1",
+        "timeout": 30,
+        "payload": {
+            "prompt": "edit",
+            "files": [{"path": "input.txt", "content": "seed"}],
+            "expect_files_back": ["input.txt", "result.txt", "missing.txt"],
+        },
+    }
+
+    result = oc._run_cli_for_task(
+        task, workdir, role_prompt=None, budget=10_000,
+        role="coder", hub=_FakeHub(),
+    )
+
+    # Materialization happened before subprocess.
+    assert (workdir / "input.txt").read_text(encoding="utf-8") == "seed"
+
+    # Parsed assistant text from JSONL stdout.
+    assert result["text"] == "done"
+    assert result["cli"] == "opencode"
+    assert result["role"] == "coder"
+
+    # Readback returned both files.
+    assert "files" in result
+    by_path = {f["path"]: f["content"] for f in result["files"]}
+    assert by_path == {
+        "input.txt": "seed",
+        "result.txt": "done",
+    }
+    assert result.get("files_missing") == ["missing.txt"]
+    assert "files_truncated" not in result
+
+
+def test_p24_unit_opencode_rejects_session_marker_via_payload(tmp_path, monkeypatch):
+    """A payload trying to write `.opencode-session-started` is rejected at
+    `validate_files` time via Unit A's RESERVED_NAMES guard. The adapter
+    surfaces it as TaskFailed(error="invalid_payload_files",
+    reason="path_reserved"). The subprocess is NOT invoked.
+    """
+    from agent_sdk import TaskFailed
+    from clients.opencode import llm_agent as oc
+
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    called = {"n": 0}
+
+    def fake_run(cmd, capture_output, text, timeout, cwd):  # pragma: no cover
+        called["n"] += 1
+        raise AssertionError("subprocess.run must not be called when payload is rejected")
+
+    monkeypatch.setattr(oc.subprocess, "run", fake_run)
+
+    class _FakeHub:
+        def send_activity_log(self, *a, **kw):
+            pass
+
+    task = {
+        "task_id": "t1",
+        "timeout": 30,
+        "payload": {
+            "prompt": "ping",
+            "files": [{"path": ".opencode-session-started", "content": "x"}],
+        },
+    }
+
+    with pytest.raises(TaskFailed) as ei:
+        oc._run_cli_for_task(
+            task, workdir, role_prompt=None, budget=10_000,
+            role="coder", hub=_FakeHub(),
+        )
+
+    failure = ei.value.result
+    assert failure.get("error") == "invalid_payload_files"
+    assert failure.get("reason") == "path_reserved"
+    assert failure.get("cli") == "opencode"
+    assert failure.get("role") == "coder"
+    assert called["n"] == 0
+    # Session marker must not have been created by adapter.
+    assert not (workdir / oc._SESSION_MARKER).exists()
+
+
+# === Phase 2.4 Unit D — claude_code adapter integration ==================
+
+
+def test_p24_unit_claude_materialize_then_readback(tmp_path, monkeypatch):
+    """Unit D: claude_code adapter materializes payload.files BEFORE the
+    CLI runs, then reads back `expect_files_back` AFTER success.
+
+    Mirrors Unit C (codex). Mocks subprocess.run to (a) write
+    `review.md` as a side-effect (proving readback can pick up files
+    produced by the CLI itself) and (b) return success JSON.
+    """
+    from clients.claude_code import llm_agent as cc
+
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+
+    class _CP:
+        def __init__(self, stdout, returncode=0, stderr=""):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    captured = {}
+
+    def fake_run(cmd, capture_output, text, timeout, cwd):
+        captured["cmd"] = list(cmd)
+        captured["cwd"] = cwd
+        # Materialization must have already happened before subprocess.run.
+        assert (workdir / "src.py").exists(), \
+            "src.py should be materialized before CLI runs"
+        assert (workdir / "src.py").read_text(encoding="utf-8") == "def f(): pass"
+        # Side-effect: write review.md (the "CLI's output").
+        (workdir / "review.md").write_text("LGTM", encoding="utf-8")
+        return _CP(
+            json.dumps({
+                "result": "reviewed",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            }),
+            returncode=0,
+        )
+
+    monkeypatch.setattr(cc.subprocess, "run", fake_run)
+
+    class _FakeHub:
+        def send_activity_log(self, *a, **kw):
+            pass
+
+    task = {
+        "task_id": "t-claude-d",
+        "timeout": 60,
+        "payload": {
+            "prompt": "review",
+            "files": [{"path": "src.py", "content": "def f(): pass"}],
+            "expect_files_back": ["src.py", "review.md"],
+        },
+    }
+
+    result = cc._run_cli_for_task(
+        task, workdir,
+        role_prompt=None, budget=None, role="reviewer", hub=_FakeHub(),
+    )
+
+    # Subprocess was actually called.
+    assert captured.get("cmd") and captured["cmd"][0] == "claude"
+
+    # Result text comes from the `result` field of the claude JSON.
+    assert result["text"] == "reviewed"
+    assert result["cli"] == "claude"
+    assert result["role"] == "reviewer"
+
+    # Both files were read back.
+    assert "files" in result
+    files_by_path = {f["path"]: f["content"] for f in result["files"]}
+    assert files_by_path == {
+        "src.py": "def f(): pass",
+        "review.md": "LGTM",
+    }
+    # No misses, no truncation.
+    assert "files_missing" not in result
+    assert "files_truncated" not in result

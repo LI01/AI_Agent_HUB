@@ -46,6 +46,17 @@ Other flags:
 - `--no-poll` — submit and return the `task_id` immediately, no polling.
 - `--interactive` — force interactive prompting even when other flags are
   supplied.
+- `--file <rel>=<local>` — attach a local UTF-8 text file as a
+  `payload.files` entry. `<rel>` is the path inside the agent's workdir
+  (relative, no `..`, no leading `/`, no `\`). `<local>` is the path on
+  your machine. Repeatable. Merges with any `files` already supplied via
+  `--payload`. Hard-fails on binary input — base64 fallback is Phase
+  2.5+. Example: `--file plan.md=./design/plan.md`.
+- `--expect-back <rel>` — request that the agent's workdir be read back
+  at `<rel>` into `result.files` after the task completes. Repeatable.
+  Merges with any `expect_files_back` already supplied via `--payload`.
+  Files read back are subject to the per-file (1 MiB) and per-task
+  (5 MiB) caps; oversize files are reported in `result.files_truncated`.
 
 ## Behavior
 

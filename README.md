@@ -2,7 +2,7 @@
 
 A central task dispatch and coordination server for heterogeneous AI agents running across Docker containers, developer machines, and cloud hosts. Humans submit tasks via REST or MCP; the hub routes work to available agents over WebSocket; agents report status, logs, and structured results back.
 
-**Status:** Phase 1 MVP + Phase 1.5 MCP + Phase 2 (F1 delegation, F2 parent_task_id) + Phase 2.2 (F3 versioned capabilities, F4 discovery) + Phase 2.3 (LLM-CLI worker skills + adapters) — **168/168 tests passing**, ship-ready. See [`test_report.md`](./test_report.md).
+**Status:** Phase 1 MVP + Phase 1.5 MCP + Phase 2 (F1 delegation, F2 parent_task_id) + Phase 2.2 (F3 versioned capabilities, F4 discovery) + Phase 2.3 (LLM-CLI worker skills + adapters) + Phase 2.4 (file sharing via payload.files) — **192/192 tests passing**, ship-ready. See [`test_report.md`](./test_report.md).
 
 ## What it does
 
@@ -19,6 +19,7 @@ A central task dispatch and coordination server for heterogeneous AI agents runn
 - **Version capabilities** with payload schemas: agents advertise `{name, version, payload_schema, result_schema}`; tasks request `min_version`; hub validates payloads (warn or strict via `AGENT_HUB_VALIDATE_PAYLOAD`) — Phase 2.2.
 - **Discover** what's available: `GET /capabilities` returns aggregated `(name, version)` pairs across online agents — Phase 2.2.
 - **Spawn agents** as wrappers around codex / claude / opencode CLIs via the `/agent-spawn`, `/agent-tasks`, `/agent-close` skills. One CLI per agent, per role; multiple per machine — Phase 2.3.
+- **Share files with agents** via `payload.files = [{path, content}]` (materialized to workdir before CLI runs) and `payload.expect_files_back = [paths]` (read back into `result.files`). 1 MiB per file, 5 MiB per task; path-traversal-safe — Phase 2.4.
 
 Out of scope for Phase 1: agent-to-agent delegation, multi-hub federation, DAG workflows, web UI, Prometheus metrics. See [`requirements.md`](./requirements.md) §4.2.
 

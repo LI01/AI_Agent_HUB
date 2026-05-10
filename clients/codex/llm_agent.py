@@ -19,6 +19,9 @@ import time
 from pathlib import Path
 
 from agent_sdk import AgentHub, TaskFailed
+from clients._files import (
+    InvalidPayloadFiles, materialize_files, readback_files,
+)
 from clients.role_presets import BUILTIN_PRESETS, get_preset, load_user_overrides
 
 
@@ -84,6 +87,27 @@ def _run_cli_for_task(task, workdir, role_prompt, budget, role, hub) -> dict:
         timeout_f = 300.0
     deadline = compute_deadline(timeout_f)
 
+    # Phase 2.4 finding #5: explicit key-presence + is-not-None gate so
+    # malformed shapes hit validate_files instead of silently skipping.
+    payload = task.get("payload") or {}
+    if isinstance(payload, dict) and "files" in payload \
+            and payload["files"] is not None:
+        try:
+            materialize_files(workdir, payload["files"])
+        except InvalidPayloadFiles as e:
+            error = (
+                "payload_too_large"
+                if e.reason in {"file_too_large", "total_too_large"}
+                else "invalid_payload_files"
+            )
+            raise TaskFailed({
+                "error": error,
+                "reason": e.reason,
+                "detail": e.detail,
+                "cli": CLI_NAME,
+                "role": role,
+            })
+
     cmd = [
         "codex", "exec",
         "--skip-git-repo-check",
@@ -127,6 +151,29 @@ def _run_cli_for_task(task, workdir, role_prompt, budget, role, hub) -> dict:
         "role": role,
         "elapsed_s": elapsed,
     }
+
+    # Phase 2.4: readback after success, before budget tracking.
+    if isinstance(payload, dict) and "expect_files_back" in payload \
+            and payload["expect_files_back"] is not None:
+        try:
+            files_out, missing, truncated = readback_files(
+                workdir, payload["expect_files_back"],
+            )
+        except InvalidPayloadFiles as e:
+            # Only invalid_expect_files_back can come from readback.
+            raise TaskFailed({
+                "error": "invalid_payload_files",
+                "reason": e.reason,
+                "detail": e.detail,
+                "cli": CLI_NAME,
+                "role": role,
+            })
+        if files_out:
+            result["files"] = files_out
+        if missing:
+            result["files_missing"] = missing
+        if truncated:
+            result["files_truncated"] = truncated
 
     # Budget tracking — char heuristic, codex doesn't expose token usage natively.
     est_tokens = len(parsed) // 4

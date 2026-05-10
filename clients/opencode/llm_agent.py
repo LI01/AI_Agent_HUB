@@ -24,6 +24,11 @@ from pathlib import Path
 from typing import Any
 
 from agent_sdk import AgentHub, TaskFailed
+from clients._files import (
+    InvalidPayloadFiles,
+    materialize_files,
+    readback_files,
+)
 from clients.role_presets import get_preset, load_user_overrides
 
 
@@ -199,6 +204,28 @@ def _run_cli_for_task(task, workdir: Path, role_prompt: str | None,
     timeout = int(task.get("timeout") or 300)
     deadline = compute_deadline(timeout)
 
+    # Phase 2.4: materialize payload.files into workdir BEFORE the
+    # subprocess runs. Empty list / None / absent key are no-ops.
+    # Unit A's RESERVED_NAMES already blocks ".opencode-session-started",
+    # so the marker check below sees only state from prior real runs.
+    if isinstance(payload, dict) and "files" in payload \
+            and payload["files"] is not None:
+        try:
+            materialize_files(workdir, payload["files"])
+        except InvalidPayloadFiles as e:
+            error = (
+                "payload_too_large"
+                if e.reason in {"file_too_large", "total_too_large"}
+                else "invalid_payload_files"
+            )
+            raise TaskFailed({
+                "error": error,
+                "reason": e.reason,
+                "detail": e.detail,
+                "cli": CLI_NAME,
+                "role": role,
+            })
+
     marker = workdir / _SESSION_MARKER
     session_started = marker.exists()
     cmd = _build_cmd(full_prompt, session_started)
@@ -291,6 +318,28 @@ def _run_cli_for_task(task, workdir: Path, role_prompt: str | None,
         "role": role,
         "elapsed_s": elapsed,
     }
+
+    # Phase 2.4: read back requested files AFTER successful subprocess.
+    if isinstance(payload, dict) and "expect_files_back" in payload \
+            and payload["expect_files_back"] is not None:
+        try:
+            files_out, missing, truncated = readback_files(
+                workdir, payload["expect_files_back"],
+            )
+        except InvalidPayloadFiles as e:
+            raise TaskFailed({
+                "error": "invalid_payload_files",
+                "reason": e.reason,
+                "detail": e.detail,
+                "cli": CLI_NAME,
+                "role": role,
+            })
+        if files_out:
+            result["files"] = files_out
+        if missing:
+            result["files_missing"] = missing
+        if truncated:
+            result["files_truncated"] = truncated
 
     # Budget tracking — warn-only.
     if budget and usage:

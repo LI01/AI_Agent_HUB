@@ -357,6 +357,57 @@ Rules:
 - Exceptions: `ChildRejectedError` (cycle, depth, target_unavailable, not_owner, parent_terminal, forbidden, bad_request), `ChildWaitTimeout`, `ChildNotInTaskContext` (called outside a handler).
 - Both `AgentHub` (sync) and `AsyncAgentHub` (async) expose `submit_child(...)`. The async variant integrates with `asyncio`, and both keep the WS reader independent of handler execution so a parent waiting on a child does not deadlock.
 
+### 2.7.6 Sharing files with agents (Phase 2.4)
+
+Some CLIs (notably codex) operate on files in the workspace, not on prompt text. To send files to an agent, attach them in the payload; the adapter writes them to the agent's workdir before invoking the CLI. To receive files back, list them in `expect_files_back`:
+
+```bash
+curl -X POST http://localhost:8080/tasks \
+  -H "Authorization: Bearer $YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task_type": "review",
+    "target_agent": "andrew-ubuntu-codex-1",
+    "payload": {
+      "prompt": "Review the file binary_search.py for real bugs.",
+      "files": [{"path": "binary_search.py", "content": "def binary_search(arr, target):\n    ..."}],
+      "expect_files_back": ["binary_search.py"]
+    }
+  }'
+```
+
+Result includes:
+
+```json
+{
+  "result": {
+    "text": "Found 3 bugs: ...",
+    "files": [{"path": "binary_search.py", "content": "<modified or original source>"}],
+    "files_missing": [],
+    "files_truncated": []
+  }
+}
+```
+
+Or via the skill:
+
+```
+/agent-tasks --agent andrew-ubuntu-codex-1 --task-type review \
+  --file binary_search.py=./local/binary_search.py \
+  --expect-back binary_search.py
+```
+
+**Rules:**
+
+- Path validation: no leading `/`, no `..`, no backslashes, no Windows drive prefixes (`C:`). Symlink-aware parent-chain check blocks `trap -> outside` attacks.
+- **Limits**: 1 MiB per file, 5 MiB total per task. Beyond → task fails with `error="payload_too_large"`. Shape/path errors → `error="invalid_payload_files"`.
+- Reserved name `.opencode-session-started` blocked (adapter-private state).
+- v1 is **text only** (UTF-8). Binary content (base64) is Phase 2.5.
+- `expect_files_back` is explicit — auto-detect of changed workdir files is out of scope.
+- Files missing on readback are listed in `result.files_missing` (not an error). Files exceeding the cap are listed in `result.files_truncated` with `{path, reason, size, cap}`.
+
+For pipelines that share files across roles (planner → coder → reviewer), pass `result.files` from one task into the next task's `payload.files`.
+
 ### 2.8 Try it end-to-end
 
 ```bash

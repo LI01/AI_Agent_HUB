@@ -21,6 +21,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 from agent_sdk import AgentHub, TaskFailed
+from clients._files import (
+    InvalidPayloadFiles,
+    materialize_files,
+    readback_files,
+)
 from clients.role_presets import (
     BUILTIN_PRESETS,
     get_preset,
@@ -173,6 +178,30 @@ def _run_cli_for_task(
     timeout = int(task.get("timeout") or 300)
     deadline = compute_deadline(timeout)
 
+    # Phase 2.4: materialize payload.files into the workdir BEFORE the CLI
+    # runs so the model sees them on disk. Codex finding #5 — explicit
+    # `is not None` so a malformed-but-present `files` shape (e.g. a string)
+    # raises rather than being silently skipped by truthiness.
+    if isinstance(payload, dict) and "files" in payload \
+            and payload["files"] is not None:
+        try:
+            materialize_files(workdir, payload["files"])
+        except InvalidPayloadFiles as e:
+            # Finding #4 verbatim mapping: size caps -> payload_too_large,
+            # everything else (shape / path) -> invalid_payload_files.
+            error = (
+                "payload_too_large"
+                if e.reason in {"file_too_large", "total_too_large"}
+                else "invalid_payload_files"
+            )
+            raise TaskFailed({
+                "error": error,
+                "reason": e.reason,
+                "detail": e.detail,
+                "cli": CLI_NAME,
+                "role": role,
+            })
+
     cmd = _build_claude_cmd(workdir, role_prompt, prompt)
 
     t0 = time.monotonic()
@@ -223,6 +252,32 @@ def _run_cli_for_task(
         "role": role,
         "elapsed_s": elapsed,
     }
+
+    # Phase 2.4: readback requested files AFTER successful subprocess.
+    # Same `is not None` guard so non-list shapes are surfaced as a
+    # TaskFailed rather than iterated char-by-char.
+    if isinstance(payload, dict) and "expect_files_back" in payload \
+            and payload["expect_files_back"] is not None:
+        try:
+            files_out, missing, truncated = readback_files(
+                workdir, payload["expect_files_back"],
+            )
+        except InvalidPayloadFiles as e:
+            # Only `invalid_expect_files_back` reaches here (per-entry
+            # failures inside readback are silent skips into `missing`).
+            raise TaskFailed({
+                "error": "invalid_payload_files",
+                "reason": e.reason,
+                "detail": e.detail,
+                "cli": CLI_NAME,
+                "role": role,
+            })
+        if files_out:
+            result["files"] = files_out
+        if missing:
+            result["files_missing"] = missing
+        if truncated:
+            result["files_truncated"] = truncated
 
     if budget and usage_total > budget:
         result["payload_schema_warn"] = (

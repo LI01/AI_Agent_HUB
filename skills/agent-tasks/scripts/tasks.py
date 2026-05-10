@@ -27,6 +27,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from clients._state import locked_read_spawned  # noqa: E402
+from clients._files import (  # noqa: E402
+    InvalidPayloadFiles,
+    _validate_relpath,
+)
 
 
 # --- HTTP helpers --------------------------------------------------------
@@ -322,6 +326,59 @@ def _prompt_raw_json(
     return parsed
 
 
+# --- --file / --expect-back parsing (Phase 2.4 design v2 §4.2) ----------
+
+
+def _parse_file_flags(file_args: Optional[list[str]]) -> list[dict]:
+    """Parse repeated `--file <rel>=<local>` values into payload.files entries.
+
+    Each ``spec`` is a single string with one ``=`` separating the in-payload
+    relative path from the local source path. The local file is read as
+    UTF-8 text and embedded as a string. Hard-fails on:
+
+      - missing ``=`` or empty side
+      - relpath that fails ``clients._files._validate_relpath`` (leading
+        ``/``, ``\\``, drive letters, ``..``, empty parts)
+      - local file does not exist or is unreadable
+      - local file is not valid UTF-8 (binary support is Phase 2.5+;
+        codex Q-answer #2 — no silent base64)
+
+    Returns a list of ``{"path": rel, "content": text}`` dicts, in the
+    order of the input flags.
+    """
+    if not file_args:
+        return []
+    out: list[dict] = []
+    for spec in file_args:
+        if "=" not in spec:
+            raise SystemExit(
+                f"--file expects <rel>=<local>, got {spec!r}"
+            )
+        rel, _, local = spec.partition("=")
+        rel = rel.strip()
+        local = local.strip()
+        if not rel or not local:
+            raise SystemExit(f"--file empty side: {spec!r}")
+        # Validate the in-payload relpath up front so the user gets a
+        # clear local error before the task is ever submitted. The
+        # adapter would catch this server-side anyway via validate_files.
+        try:
+            _validate_relpath(rel)
+        except InvalidPayloadFiles as e:
+            raise SystemExit(
+                f"--file {spec!r}: invalid path ({e.reason}: {e.detail})"
+            )
+        # FileNotFoundError and UnicodeDecodeError propagate so callers
+        # (including the skill's pytest unit tests per the Phase 2.4 unit
+        # B spec) can distinguish "missing local file" from "binary local
+        # file" without re-parsing a SystemExit message. The CLI entry
+        # point in main() converts both to SystemExit so user-facing UX
+        # stays a clean error line.
+        content = pathlib.Path(local).read_text(encoding="utf-8")
+        out.append({"path": rel, "content": content})
+    return out
+
+
 # --- task lifecycle ------------------------------------------------------
 
 
@@ -444,6 +501,28 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force interactive prompting even when other flags are supplied.",
     )
+    # Phase 2.4 — file sharing.
+    p.add_argument(
+        "--file",
+        action="append",
+        default=None,
+        metavar="REL=LOCAL",
+        help=(
+            "Attach a local UTF-8 text file as a payload.files entry. "
+            "REL is the path inside the agent's workdir; LOCAL is the path on "
+            "your machine. Repeatable. Merges with any --payload-supplied files."
+        ),
+    )
+    p.add_argument(
+        "--expect-back",
+        action="append",
+        default=None,
+        metavar="REL",
+        help=(
+            "Request a relative path be read back from the agent's workdir "
+            "into result.files. Repeatable."
+        ),
+    )
     return p
 
 
@@ -558,6 +637,40 @@ def main(argv: Optional[list[str]] = None) -> int:
             raise SystemExit("--payload must be a JSON object.")
     else:
         payload = prompt_payload_from_schema(payload_schema, task_type)
+
+    # 3b. Merge --file / --expect-back into the payload (design v2 §4.3).
+    # MERGE semantics: extend any list already supplied via --payload; only
+    # raise on a type conflict (non-list `files` / `expect_files_back`).
+    try:
+        extra_files = _parse_file_flags(args.file)
+    except FileNotFoundError as e:
+        raise SystemExit(f"--file: {e}")
+    except UnicodeDecodeError as e:
+        raise SystemExit(
+            f"--file: local file is not UTF-8 ({e}); binary is Phase 2.5+."
+        )
+    if extra_files:
+        existing = payload.get("files")
+        if isinstance(existing, list):
+            payload["files"] = existing + extra_files
+        elif existing is None:
+            payload["files"] = extra_files
+        else:
+            raise SystemExit(
+                "--payload sets files= to a non-list; cannot merge --file."
+            )
+
+    if args.expect_back:
+        existing_eb = payload.get("expect_files_back")
+        if isinstance(existing_eb, list):
+            payload["expect_files_back"] = existing_eb + list(args.expect_back)
+        elif existing_eb is None:
+            payload["expect_files_back"] = list(args.expect_back)
+        else:
+            raise SystemExit(
+                "--payload sets expect_files_back= to a non-list; "
+                "cannot merge --expect-back."
+            )
 
     # 4. Submit.
     task_id = submit_task(
