@@ -88,7 +88,13 @@ def _build_claude_cmd(
         cmd.append("--bare")
     if os.environ.get("AGENT_HUB_CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS") == "1":
         cmd.append("--dangerously-skip-permissions")
-    cmd += ["--output-format", "json", "--add-dir", str(workdir)]
+    # `--add-dir <directories...>` is variadic, so passing it as two separate
+    # argv tokens lets it swallow the next positional (the prompt) when
+    # nothing flag-shaped sits between them — e.g. when role_prompt is None
+    # and `--append-system-prompt` is omitted. Use the `--flag=value` form to
+    # bind the directory unambiguously and keep the prompt as the trailing
+    # positional arg regardless of which other flags are present.
+    cmd += ["--output-format", "json", f"--add-dir={workdir}"]
     if role_prompt is not None:
         cmd += ["--append-system-prompt", role_prompt]
     cmd.append(prompt)

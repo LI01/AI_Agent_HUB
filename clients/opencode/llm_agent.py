@@ -179,8 +179,26 @@ def _extract_usage(events: list[dict]) -> dict | None:
 
 
 def _build_cmd(prompt: str, session_started: bool) -> list[str]:
+    """Build the opencode argv for one task.
+
+    Default: `opencode run --format json --dangerously-skip-permissions <prompt>`.
+    Set `AGENT_HUB_OPENCODE_REQUIRE_PERMISSIONS=1` to drop the skip flag — but
+    note that without it, any tool call opencode can't auto-allow (e.g. Write
+    to a path it considers "external_directory") will block the run forever
+    waiting on an interactive permission prompt that never comes in `run`
+    mode. Don't disable this without a config that pre-allows tool use.
+
+    `session_started` toggles `-c` (continue last session). Stale sessions can
+    carry a project-root different from the current workdir, which makes
+    paths look "external" and re-triggers the permission ask above; set
+    `AGENT_HUB_OPENCODE_NO_SESSION_REUSE=1` to disable.
+    """
     cmd = ["opencode", "run", "--format", "json"]
-    if session_started:
+    if os.environ.get("AGENT_HUB_OPENCODE_REQUIRE_PERMISSIONS") != "1":
+        cmd.append("--dangerously-skip-permissions")
+    if session_started and os.environ.get(
+        "AGENT_HUB_OPENCODE_NO_SESSION_REUSE"
+    ) != "1":
         cmd.append("-c")
     cmd.append(prompt)
     return cmd
@@ -232,12 +250,28 @@ def _run_cli_for_task(task, workdir: Path, role_prompt: str | None,
 
     t0 = time.monotonic()
     try:
+        # opencode resolves "is this path inside the workspace?" against the
+        # `PWD` env var, not getcwd(). subprocess.run's `cwd=` only changes
+        # getcwd(); PWD is inherited from the agent's parent shell (typically
+        # the install dir), so absolute writes to the actual workdir get
+        # flagged as `permission=external_directory action=ask` and the run
+        # blocks forever in non-interactive mode (even with
+        # --dangerously-skip-permissions, which doesn't bypass that specific
+        # permission). Forcing PWD=workdir here makes opencode see writes
+        # under workdir as in-workspace. Verified against opencode 1.14.46:
+        # 30s timeout without this, ~8s success with it.
+        # stdin=/dev/null is also defensive: opencode `run` mode hangs in
+        # init if stdin is an inherited pipe rather than TTY or /dev/null.
+        env = os.environ.copy()
+        env["PWD"] = str(workdir)
         cp = subprocess.run(
             cmd,
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
             timeout=deadline,
             cwd=str(workdir),
+            env=env,
         )
     except subprocess.TimeoutExpired:
         elapsed = round(time.monotonic() - t0, 2)
