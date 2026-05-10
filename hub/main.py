@@ -867,6 +867,13 @@ async def handle_agent_message(agent_id: str, msg: dict):
                 task_event_data(task_id, log=log),
             )
 
+    elif msg_type == "activity_log":
+        task_id = msg.get("task_id")
+        action = msg.get("action")
+        details = msg.get("details") or {}
+        if task_id and action and reporter_owns_task(task_id, agent_id):
+            db.log_activity("task", task_id, action, details)
+
     elif msg_type == "submit_child":
         await _handle_submit_child(agent_id, msg)
 

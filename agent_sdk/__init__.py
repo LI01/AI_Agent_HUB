@@ -1,3 +1,3 @@
-from .client import AgentHub, AsyncAgentHub
+from .client import AgentHub, AsyncAgentHub, TaskFailed
 
-__all__ = ["AgentHub", "AsyncAgentHub"]
+__all__ = ["AgentHub", "AsyncAgentHub", "TaskFailed"]

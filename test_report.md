@@ -1,9 +1,9 @@
 # Agent Hub — Phase 1 Test Report
 
 **Tested by:** claude
-**Last update:** 2026-05-09 (Phase 2.2 F3+F4 added: 109 → 127)
-**Suite:** `tests/` (pytest), 127 cases
-**Result:** **127/127 pass.** Phase 2.2 delivered autonomously by sub-agents in 16 invocations (`Agent-comm/claude_phase2.2-delivered_20260509-0631.md`).
+**Last update:** 2026-05-09 (Phase 2.3 LLM-CLI worker skills added: 127 → 168, plus +2 unregister_on_stop = 129 baseline)
+**Suite:** `tests/` (pytest), 168 cases
+**Result:** **168/168 pass.** Phase 2.3 delivered autonomously by sub-agents in 33 invocations (`Agent-comm/claude_phase2.3-delivered_20260509-1719.md`).
 **Run command:** `.venv/bin/python -m pytest tests/ -v`
 
 ---
@@ -18,7 +18,9 @@
 | D — MCP protocol (Phase 1.5) | `requirements.md` §9.9 FR-MCP-7 | `tests/test_mcp_protocol.py` | 5 | 5 | 0 |
 | E — F1 delegation + F2 parent_task_id (Phase 2) | `design/phase2/design_v3.md` §5 | `tests/test_unit.py`, `tests/test_websocket.py`, `tests/test_rest.py`, `tests/test_persistence_security.py`, `tests/test_sdk.py` | 27 | 27 | 0 |
 | F — F3 versioned capabilities + F4 discovery (Phase 2.2) | `design/phase2.2/design_v2.md` §6 | `tests/test_unit.py`, `tests/test_persistence_security.py`, `tests/test_rest.py`, `tests/test_websocket.py`, `tests/test_mcp_protocol.py` | 18 | 18 | 0 |
-| **Total** | | | **127** | **127** | **0** |
+| G — unregister_on_stop SDK flag | (post-Phase 2.2 patch) | `tests/test_sdk.py` | 2 | 2 | 0 |
+| H — LLM-CLI worker skills (Phase 2.3) | `design/phase2.3/design_v3.md` §8 | `tests/test_unit.py`, `tests/test_sdk.py` | 39 | 39 | 0 |
+| **Total** | | | **168** | **168** | **0** |
 
 **Phase D (MCP) coverage:** `tools/list` exposes the FR-MCP-2/3 schemas; `tools/call submit-task` round-trips through `get-task`; permission failures map to JSON-RPC errors without leaking raw keys; revoked-mid-session keys fail on the next tool call (per-call `access_control` revalidation works); stdio entrypoint smoke does not write to the wrong DB path.
 

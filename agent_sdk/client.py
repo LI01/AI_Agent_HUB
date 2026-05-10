@@ -36,6 +36,22 @@ class ChildNotInTaskContext(Exception):
     """Raised when submit_child is called outside of an active task handler."""
 
 
+class TaskFailed(Exception):
+    """Raised by a task handler to report a structured failure result.
+
+    Phase 2.3 §3.0: handlers raise this to short-circuit the generic
+    Exception path and emit `status="failed"` with a caller-supplied
+    `result` dict (preserving structured fields like `error`, `raw`,
+    `usage`, etc.).
+    """
+
+    def __init__(self, result: dict):
+        super().__init__(
+            result.get("error") if isinstance(result, dict) else str(result)
+        )
+        self.result = result if isinstance(result, dict) else {"error": str(result)}
+
+
 class AgentHub:
     def __init__(
         self,
@@ -46,6 +62,7 @@ class AgentHub:
         task_handler: Optional[Callable] = None,
         reconnect: bool = True,
         unregister_on_stop: bool = False,
+        description: Optional[str] = None,
     ):
         self.hub_url = hub_url.rstrip("/")
         self.ws_url = self.hub_url.replace("http://", "ws://").replace("https://", "wss://")
@@ -55,6 +72,7 @@ class AgentHub:
         self._task_handler = task_handler
         self.reconnect = reconnect
         self.unregister_on_stop = unregister_on_stop
+        self.description = description
         self._running = False
         self._ws = None
 
@@ -83,12 +101,15 @@ class AgentHub:
 
     def _on_open(self, ws):
         # Use raw send here; ws is fresh and we haven't stored it yet.
-        ws.send(json.dumps({
+        register_frame = {
             "type": "register",
             "agent_id": self.agent_id,
             "capabilities": self.capabilities,
             "auth_token": self.auth_token,
-        }))
+        }
+        if self.description is not None:
+            register_frame["description"] = self.description
+        ws.send(json.dumps(register_frame))
         print(f"Agent {self.agent_id} sent registration")
 
     def _on_message(self, ws, message):
@@ -187,6 +208,13 @@ class AgentHub:
                     "task_id": task_id,
                     "status": "completed",
                     "result": result,
+                })
+            except TaskFailed as exc:
+                self._send_json({
+                    "type": "result",
+                    "task_id": task_id,
+                    "status": "failed",
+                    "result": exc.result,
                 })
             except Exception as exc:
                 self._send_json({
@@ -354,6 +382,19 @@ class AgentHub:
     def send_log(self, task_id: str, log: str):
         self._send_json({"type": "log", "task_id": task_id, "log": log})
 
+    def send_activity_log(self, task_id: str, action: str, details: dict) -> None:
+        """Phase 2.3 §3.0/§6.4: emit an `activity_log` WS message.
+
+        The hub's `handle_agent_message` validates ownership via
+        `reporter_owns_task` and persists the row to `activity_log`.
+        """
+        self._send_json({
+            "type": "activity_log",
+            "task_id": task_id,
+            "action": action,
+            "details": details,
+        })
+
 
 class AsyncAgentHub:
     def __init__(
@@ -364,6 +405,7 @@ class AsyncAgentHub:
         auth_token: Optional[str] = None,
         task_handler: Optional[Callable] = None,
         unregister_on_stop: bool = False,
+        description: Optional[str] = None,
     ):
         self.hub_url = hub_url.rstrip("/")
         self.ws_url = self.hub_url.replace("http://", "ws://").replace("https://", "wss://")
@@ -372,6 +414,7 @@ class AsyncAgentHub:
         self.auth_token = auth_token
         self._task_handler = task_handler
         self.unregister_on_stop = unregister_on_stop
+        self.description = description
         self._ws = None
 
         # Phase 2 §2.2.6: send-side serialization + pending-wait maps.
@@ -389,17 +432,29 @@ class AsyncAgentHub:
         import websockets
 
         self._ws = await websockets.connect(f"{self.ws_url}/ws")
-        await self._ws.send(json.dumps({
+        register_frame = {
             "type": "register",
             "agent_id": self.agent_id,
             "capabilities": self.capabilities,
             "auth_token": self.auth_token,
-        }))
+        }
+        if self.description is not None:
+            register_frame["description"] = self.description
+        await self._ws.send(json.dumps(register_frame))
         return json.loads(await self._ws.recv())
 
     async def send(self, msg: dict):
         async with self._send_lock:
             await self._ws.send(json.dumps(msg))
+
+    async def send_activity_log(self, task_id: str, action: str, details: dict) -> None:
+        """Phase 2.3 §3.0/§6.4 — async equivalent of AgentHub.send_activity_log."""
+        await self.send({
+            "type": "activity_log",
+            "task_id": task_id,
+            "action": action,
+            "details": details,
+        })
 
     async def stop(self):
         if self.unregister_on_stop:
@@ -479,6 +534,8 @@ class AsyncAgentHub:
                 else:
                     raise RuntimeError("No task handler configured")
                 await self.send({"type": "result", "task_id": task_id, "status": "completed", "result": result})
+            except TaskFailed as exc:
+                await self.send({"type": "result", "task_id": task_id, "status": "failed", "result": exc.result})
             except Exception as exc:
                 await self.send({"type": "result", "task_id": task_id, "status": "failed", "result": {"error": str(exc)}})
         finally:
