@@ -379,6 +379,144 @@ curl http://localhost:8080/tasks/<task_id> -H "Authorization: Bearer <submitter-
 
 ---
 
+## 2.9 Spawning LLM-CLI workers via skills (Phase 2.3)
+
+If your "agent" is just an LLM CLI doing focused work (codex designs, claude reviews, opencode tests), you don't need to write a Python script. Three skills wrap the existing `codex` / `claude` / `opencode` CLIs as hub workers.
+
+### 2.9.1 Prerequisites
+
+- The CLIs you plan to use must already be installed and authenticated on this machine: `codex login`, `claude login`, `opencode auth ...`. The skills don't manage CLI auth — they just verify `<cli> --version` works.
+- An admin or `can_register` API key for the hub.
+- Optional: `~/.agent-hub/config.json` with defaults so you don't retype `hub_url` and `api_key`:
+
+```json
+{
+  "hub_url": "http://192.168.1.38:8300",
+  "api_key": "your-api-key",
+  "role_budgets": {"coder": 50000},
+  "role_prompts": {"reviewer": "You are a security-focused reviewer. ..."}
+}
+```
+
+A per-project `.agent-hub.local.json` in your cwd overrides the global file.
+
+### 2.9.2 `/agent-spawn` — create an LLM-backed agent
+
+```
+/agent-spawn
+? CLI [codex/claude/opencode]: codex
+? Role [pm/architect/designer/coder/reviewer/tester/generic/custom]: designer
+? agent_id [codex-designer-3a1f]: 
+? pipeline_id [default-codex-designer-3a1f]: fib-impl
+? max_budget_tokens [40000]: 
+[ok] codex --version: 0.130.0
+[ok] codex auth: looks fine
+[ok] workspace: ~/.agent-hub/pipelines/fib-impl/codex-designer-3a1f/
+[ok] spawned PID 12345; description = "cli=codex;role=designer;pipeline=fib-impl"
+```
+
+**What it does:**
+- Resolves config (flag → env → `.agent-hub.local.json` → `~/.agent-hub/config.json` → built-in default → interactive prompt).
+- Verifies the CLI's `--version` works.
+- Runs a best-effort auth probe (only aborts if explicit auth/login error text).
+- Creates `~/.agent-hub/pipelines/<pipeline_id>/<agent_id>/` workspace.
+- Starts `python -m clients.<cli>.llm_agent --hub ... --id ... --role ... --workdir ...` as a detached subprocess. API key passed via `AGENT_HUB_API_KEY` env var, never on argv.
+- Records `{agent_id, pid, cli, role, workdir, hub_url, started_at}` in `~/.agent-hub/spawned.json`.
+
+**Custom roles:** `--role custom` accepts `--capabilities a,b,c --system-prompt-extra "..."` for ad-hoc work that doesn't fit a built-in preset.
+
+**Non-interactive form** (scriptable):
+
+```bash
+python skills/agent-spawn/scripts/spawn.py \
+  --cli codex --role designer --hub http://192.168.1.38:8300 \
+  --id codex-designer-3a1f --pipeline-id fib-impl
+```
+
+### 2.9.3 `/agent-tasks` — list agents and submit tasks
+
+```
+/agent-tasks
+agent_id              | cli      | role      | status | capabilities
+codex-designer-3a1f   | codex    | designer  | idle   | design, spec
+claude-reviewer-9b2e  | claude   | reviewer  | idle   | review, code-review
+worker-7              | unknown  | unknown   | idle   | echo
+
+? Pick agent: codex-designer-3a1f
+? Capability [design/spec]: design
+? Schema-aware payload prompt:
+  - goal (string, required): build a fibonacci function
+  - context (string, optional): pure Python
+? Timeout [300]: 
+? max_budget_tokens [40000]: 
+
+submitted task_id=...
+[poll] status=running
+[poll] status=completed (1.4s)
+
+result.text: """Plan:
+1. Define def fib(n: int) -> int: ...
+..."""
+```
+
+The skill reads `payload_schema` (advertised by Phase 2.2 capabilities) and prompts for each field. For nested objects (one level deep) it recurses; for unsupported keywords (oneOf/anyOf/etc.) it falls back to raw JSON. Metadata priority for the cli/role columns: `spawned.json` → parsed `description="cli=...;role=..."` → "unknown".
+
+Non-interactive: `--agent <id> --task-type <t> --payload <json> --timeout <int>`.
+
+### 2.9.4 `/agent-close` — stop and unregister
+
+```
+/agent-close
+Spawned by these skills:
+  1. codex-designer-3a1f (pid 12345, idle)
+  2. claude-reviewer-9b2e (pid 12348, idle)
+
+Registered remotely (not in spawned.json):
+  3. worker-7
+
+? Close which? [comma list, "all", or pick] 1
+? --purge workdir? [yes/no] yes
+
+[ok] sent SIGTERM (pid 12345); exited cleanly within 1.2s
+[ok] purged ~/.agent-hub/pipelines/fib-impl/codex-designer-3a1f/
+[ok] /unregister returned 200
+```
+
+PID-reuse-safe: the skill checks `/proc/<pid>/cmdline` (Linux) or `ps -p <pid>` (other) to confirm the PID still belongs to an adapter before sending SIGTERM. If the check is inconclusive, it skips the kill rather than risk killing a reused PID. Purge runs only if termination succeeded AND PID wasn't reused AND workdir is under `~/.agent-hub/pipelines/`.
+
+For agents not in your local `spawned.json` (option 3 above — registered from another machine), the skill calls `/unregister` REST only — no kill, no purge.
+
+### 2.9.5 One PC, many agents
+
+A single PC can host many spawned agents. Run `/agent-spawn` once per role/CLI pair you want:
+
+```
+/agent-spawn cli=codex   role=designer  id=codex-pc1-designer
+/agent-spawn cli=claude  role=reviewer  id=claude-pc1-reviewer
+/agent-spawn cli=opencode role=tester    id=opencode-pc1-tester
+```
+
+Each gets its own subprocess, workspace, and `agent_id`. They'll show up independently in `GET /agents` and can be targeted by `target_agent` or matched by capability+min_version. Use unique `agent_id` prefixes (e.g. hostname) when you have more than one PC so IDs don't collide hub-wide.
+
+For "always-online" deployment, wrap each spawn in a `systemd` unit (Linux) / launchd plist (macOS) / Windows Service so they restart on crash and survive reboot. The SDK's default `reconnect=True` already handles transient hub disconnects — the supervisor only needs to deal with process crashes.
+
+### 2.9.6 Roles + system prompts at a glance
+
+| Role | Capabilities | Default budget | System prompt |
+|------|--------------|----------------|---------------|
+| pm | pm, plan, coordinate | 30k | "You are the PM. Decompose, sequence, escalate." |
+| architect | architect, design | 50k | "You are the architect. Module boundaries, data flow, tradeoffs." |
+| designer | design, spec | 40k | "You are the designer. Concrete schemas, message shapes." |
+| coder | code | 30k | "You implement features. Match style. Test-first." |
+| reviewer | review, code-review | 20k | "You critique. Find real bugs and design issues, ignore style nits." |
+| tester | test | 20k | "You write tests that fail without the change and pass with it." |
+| generic | chat | 20k | (no preset) |
+| custom | (you supply) | (you supply or default 20k) | (you supply via `--system-prompt-extra`) |
+
+Override via `~/.agent-hub/config.json` (see §2.9.1).
+
+---
+
 ## 3. Admin operations
 
 ### 3.1 Make a scoped key for a single agent
@@ -516,16 +654,22 @@ Register N agents with overlapping capabilities for parallelism. The hub assigns
 
 ---
 
-## 7. What's not in Phase 1 / 1.5
+## 7. What's shipped vs. what's not
 
-Phase 1 (task dispatch + persistence) and Phase 1.5 (real MCP server + skill) are shipped. Still out of scope:
+**Shipped:** Phase 1 (task dispatch + persistence), Phase 1.5 (real MCP server + skill), Phase 2 (agent-to-agent delegation via `submit_child` + `parent_task_id` filters), Phase 2.2 (versioned schema-bearing capabilities + `GET /capabilities` + payload validation), Phase 2.3 (LLM-CLI worker skills `/agent-spawn`, `/agent-tasks`, `/agent-close` + per-CLI adapters for codex/claude/opencode).
 
-- Agent-to-agent task delegation.
+**Still out of scope:**
+
 - Multi-hub federation.
-- DAG / task dependency graphs.
+- DAG / task dependency graphs (parent↔child links exist but no many-to-many topological execution).
+- Agent capability negotiation beyond the static schema advertised at register time.
 - Web UI dashboard.
-- Prometheus metrics.
+- Prometheus / Grafana metrics.
+- Streaming partial task results beyond incremental logs.
+- Agent groups with group-level routing.
 - Windows support is not exercised in CI (Linux + macOS only).
+- Hard-cap budget enforcement: today's `--max-budget-tokens` is warn-only.
+- Built-in file-attachment endpoint: pass content in `payload`, use a per-pipeline shared workspace, or reference an external URL.
 
 The current MCP `/mcp` endpoint is a simplified Streamable HTTP — `POST` request/response, no SSE event channel, no `Mcp-Session-Id` negotiation. Sufficient for the tested clients; flag a Phase 1.6 if a future MCP client needs full Streamable HTTP semantics.
 
