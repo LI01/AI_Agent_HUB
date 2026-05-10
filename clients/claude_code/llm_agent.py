@@ -67,19 +67,17 @@ def _build_claude_cmd(
 ) -> list[str]:
     """Build the argv for the claude CLI invocation.
 
-    Spec: `claude -p --bare --output-format json --add-dir <workdir>
-                  [--append-system-prompt <role_prompt>] <prompt>`.
+    Default: `claude -p --output-format json --add-dir <workdir>
+                     [--append-system-prompt <role_prompt>] <prompt>`.
+    Set `AGENT_HUB_CLAUDE_BARE=1` to also pass `--bare` for hermetic runs
+    (skips hooks, auto-memory, CLAUDE.md auto-discovery, and **keychain
+    reads** — requires `ANTHROPIC_API_KEY` or `apiKeyHelper`).
     `--append-system-prompt` is omitted when `role_prompt` is None.
     """
-    cmd: list[str] = [
-        "claude",
-        "-p",
-        "--bare",
-        "--output-format",
-        "json",
-        "--add-dir",
-        str(workdir),
-    ]
+    cmd: list[str] = ["claude", "-p"]
+    if os.environ.get("AGENT_HUB_CLAUDE_BARE") == "1":
+        cmd.append("--bare")
+    cmd += ["--output-format", "json", "--add-dir", str(workdir)]
     if role_prompt is not None:
         cmd += ["--append-system-prompt", role_prompt]
     cmd.append(prompt)

@@ -938,9 +938,13 @@ def test_p23_unit_opencode_parse_jsonl_events(tmp_path, monkeypatch):
 # === P23 Unit Dc — claude_code CLI adapter (design v3 §3.0 / §3.2 / §3.4) ===
 
 
-def test_p23_unit_claude_command_construction():
+def test_p23_unit_claude_command_construction(monkeypatch):
     """_build_claude_cmd produces the spec'd argv with correct ordering, and
-    omits --append-system-prompt when role_prompt is None."""
+    omits --append-system-prompt when role_prompt is None.
+
+    Default: no --bare so the user's `claude login` keychain auth works.
+    With AGENT_HUB_CLAUDE_BARE=1: --bare is added (hermetic mode).
+    """
     import pathlib
     from clients.claude_code.llm_agent import _build_claude_cmd
     from clients.role_presets import get_preset
@@ -949,13 +953,14 @@ def test_p23_unit_claude_command_construction():
     user_prompt = "<user_prompt>"
     reviewer_prompt = get_preset("reviewer")["prompt"]
 
+    monkeypatch.delenv("AGENT_HUB_CLAUDE_BARE", raising=False)
+
     cmd_with_role = _build_claude_cmd(
         pathlib.Path(workdir), reviewer_prompt, user_prompt
     )
     expected_with = [
         "claude",
         "-p",
-        "--bare",
         "--output-format",
         "json",
         "--add-dir",
@@ -965,6 +970,7 @@ def test_p23_unit_claude_command_construction():
         user_prompt,
     ]
     assert cmd_with_role == expected_with
+    assert "--bare" not in cmd_with_role
 
     # role=generic -> role_prompt is None -> --append-system-prompt omitted.
     generic_prompt = get_preset("generic")["prompt"]
@@ -976,7 +982,6 @@ def test_p23_unit_claude_command_construction():
     expected_generic = [
         "claude",
         "-p",
-        "--bare",
         "--output-format",
         "json",
         "--add-dir",
@@ -985,6 +990,13 @@ def test_p23_unit_claude_command_construction():
     ]
     assert cmd_generic == expected_generic
     assert "--append-system-prompt" not in cmd_generic
+    assert "--bare" not in cmd_generic
+
+    # Hermetic mode: --bare is added when env var is set.
+    monkeypatch.setenv("AGENT_HUB_CLAUDE_BARE", "1")
+    cmd_bare = _build_claude_cmd(pathlib.Path(workdir), reviewer_prompt, user_prompt)
+    assert "--bare" in cmd_bare
+    assert cmd_bare.index("--bare") == 2  # right after `-p`
 
 
 def test_p23_unit_claude_parse_json_response():
