@@ -21,7 +21,7 @@ A central task dispatch and coordination server for heterogeneous AI agents runn
 - **Spawn agents** as wrappers around codex / claude / opencode CLIs via the `/agent-spawn`, `/agent-tasks`, `/agent-close` skills. One CLI per agent, per role; multiple per machine — Phase 2.3.
 - **Share files with agents** via `payload.files = [{path, content}]` (materialized to workdir before CLI runs) and `payload.expect_files_back = [paths]` (read back into `result.files`). 1 MiB per file, 5 MiB per task; path-traversal-safe — Phase 2.4.
 - **MCP spec compliance** — `tools/list` returns spec-compliant `outputSchema` (top-level `object` for the 4 list-returning tools; omitted entirely on tools without a structural commitment). Unauthenticated/invalid `POST /mcp` returns `401` + `WWW-Authenticate: Bearer realm="agent-hub"` instead of `403`, so spec-compliant clients use bearer auth instead of probing OAuth. Verified end-to-end with Claude Code, Codex, and OpenCode — Phase 2.5.
-- **Boot-time install for adapter agents** — `scripts/install_agent_services.sh` drops three `systemd --user` units (claude / codex / opencode) on a Linux host, wires them to register with the hub, enables linger so they survive reboot. See [Run agents as boot services](#run-agents-as-boot-services).
+- **Boot-time install for adapter agents** — `scripts/install_agent_services.sh` drops one `systemd --user` unit per `(CLI × role)` pair on a Linux host (default 21: claude/codex/opencode × pm/architect/designer/coder/reviewer/tester/generic), wires them to register with the hub, enables linger so they survive reboot. See [Run agents as boot services](#run-agents-as-boot-services).
 
 Out of scope for Phase 1: agent-to-agent delegation, multi-hub federation, DAG workflows, web UI, Prometheus metrics. See [`requirements.md`](./requirements.md) §4.2.
 
@@ -81,7 +81,7 @@ curl -X POST http://localhost:8080/tasks \
 
 ## Run agents as boot services
 
-On a Linux host where you want claude / codex / opencode adapters to come up automatically at boot and restart on failure, use `scripts/install_agent_services.sh`. It installs three `systemd --user` units, enables linger, and starts them.
+On a Linux host where you want adapters to come up automatically at boot and restart on failure, use `scripts/install_agent_services.sh`. By default it installs one `systemd --user` unit per `(CLI × role)` pair — 3 CLIs × 7 built-in roles = **21 units**. Override `CLIS` and/or `ROLES` to install fewer.
 
 ```bash
 # On the agent host, as the user that should own the services:
@@ -96,21 +96,26 @@ curl -X POST http://<hub-host>:8300/admin/keys \
   -H "Content-Type: application/json" \
   -d '{"name":"<host>-agents","can_register":true,"can_view_agents":true,"can_view_tasks":true}'
 
-# Install and start the three services (key from env — never on argv)
+# Install and start all 21 services (key from env — never on argv)
 AGENT_HUB_API_KEY=<key-from-above> \
 AGENT_HUB_URL=http://<hub-host>:8300 \
   bash scripts/install_agent_services.sh
+
+# Or install only a subset:
+CLIS="claude codex" ROLES="reviewer designer" \
+AGENT_HUB_API_KEY=<key-from-above> \
+  bash scripts/install_agent_services.sh    # → 4 units
 ```
 
-Defaults assume the repo is at `$HOME/work/AI_Agent_HUB` and the venv at `$AGENT_HUB_REPO/.venv`. The script auto-detects `claude`, `codex`, and `opencode` CLIs from `$HOME/.local/bin` and `$HOME/.opencode/bin`. Roles default to `reviewer` / `designer` / `tester`; agent IDs default to `<cli>-<role>-$(hostname -s)`. Every default is overridable via env (`AGENT_HUB_REPO`, `AGENT_HUB_VENV`, `AGENT_HUB_WORKDIRS`, `AGENT_ID_SUFFIX`, `ROLE_CLAUDE`, `ROLE_CODEX`, `ROLE_OPENCODE`, `EXTRA_PATH`). The API key is read from `$AGENT_HUB_API_KEY` and written to `~/.config/systemd/user/agent-hub.env` (mode 0600); it never appears in argv.
+Defaults: repo at `$HOME/work/AI_Agent_HUB`, venv at `$AGENT_HUB_REPO/.venv`, CLI binaries auto-detected from `$HOME/.local/bin` and `$HOME/.opencode/bin`. Unit names follow `<cli>-<role>-agent.service`; agent IDs follow `<cli>-<role>-$(hostname -s)`. Every default is overridable via env (`AGENT_HUB_REPO`, `AGENT_HUB_VENV`, `AGENT_HUB_WORKDIRS`, `AGENT_ID_SUFFIX`, `CLIS`, `ROLES`, `EXTRA_PATH`). The API key is read from `$AGENT_HUB_API_KEY` and written to `~/.config/systemd/user/agent-hub.env` (mode 0600); it never appears in argv. Re-running the script is idempotent and migrates legacy `<cli>-agent.service` units (from the prior single-role-per-CLI scheme) by booting them out and removing them.
 
 Day-2 ops:
 
 ```bash
-systemctl --user status claude-agent codex-agent opencode-agent
-journalctl --user -u claude-agent -f
-systemctl --user restart codex-agent
-# Rotate the key: edit ~/.config/systemd/user/agent-hub.env, then restart the three services.
+systemctl --user status claude-reviewer-agent codex-designer-agent opencode-tester-agent
+journalctl --user -u claude-reviewer-agent -f
+systemctl --user restart codex-coder-agent
+# Rotate the key: edit ~/.config/systemd/user/agent-hub.env, then restart the affected units.
 ```
 
 ### Adapter env vars
