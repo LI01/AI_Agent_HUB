@@ -138,8 +138,12 @@ sudo loginctl enable-linger "$(whoami)"
 echo "lingering: $(loginctl show-user "$(whoami)" --property=Linger --value)"
 
 systemctl --user daemon-reload
+# `enable --now` is idempotent and won't restart already-running units, so a
+# re-run with changed ExecStart args (e.g. new --id) wouldn't take effect.
+# Enable + explicitly restart so unit edits always apply.
 for unit in "${UNITS[@]}"; do
-    systemctl --user enable --now "$unit"
+    systemctl --user enable "$unit" >/dev/null
+    systemctl --user restart "$unit"
 done
 
 sleep 3
