@@ -2,7 +2,7 @@
 
 A central task dispatch and coordination server for heterogeneous AI agents running across Docker containers, developer machines, and cloud hosts. Humans submit tasks via REST or MCP; the hub routes work to available agents over WebSocket; agents report status, logs, and structured results back.
 
-**Status:** Phase 1 MVP + Phase 1.5 MCP + Phase 2 (F1 delegation, F2 parent_task_id) + Phase 2.2 (F3 versioned capabilities, F4 discovery) + Phase 2.3 (LLM-CLI worker skills + adapters) + Phase 2.4 (file sharing via payload.files) — **192/192 tests passing**, ship-ready. See [`test_report.md`](./test_report.md).
+**Status:** Phase 1 MVP + Phase 1.5 MCP + Phase 2 (F1 delegation, F2 parent_task_id) + Phase 2.2 (F3 versioned capabilities, F4 discovery) + Phase 2.3 (LLM-CLI worker skills + adapters) + Phase 2.4 (file sharing via payload.files) + Phase 2.5 (MCP spec compliance — Claude Code / Codex / OpenCode all green) — ship-ready. See [`test_report.md`](./test_report.md).
 
 ## What it does
 
@@ -20,6 +20,8 @@ A central task dispatch and coordination server for heterogeneous AI agents runn
 - **Discover** what's available: `GET /capabilities` returns aggregated `(name, version)` pairs across online agents — Phase 2.2.
 - **Spawn agents** as wrappers around codex / claude / opencode CLIs via the `/agent-spawn`, `/agent-tasks`, `/agent-close` skills. One CLI per agent, per role; multiple per machine — Phase 2.3.
 - **Share files with agents** via `payload.files = [{path, content}]` (materialized to workdir before CLI runs) and `payload.expect_files_back = [paths]` (read back into `result.files`). 1 MiB per file, 5 MiB per task; path-traversal-safe — Phase 2.4.
+- **MCP spec compliance** — `tools/list` returns spec-compliant `outputSchema` (top-level `object` for the 4 list-returning tools; omitted entirely on tools without a structural commitment). Unauthenticated/invalid `POST /mcp` returns `401` + `WWW-Authenticate: Bearer realm="agent-hub"` instead of `403`, so spec-compliant clients use bearer auth instead of probing OAuth. Verified end-to-end with Claude Code, Codex, and OpenCode — Phase 2.5.
+- **Boot-time install for adapter agents** — `scripts/install_agent_services.sh` drops three `systemd --user` units (claude / codex / opencode) on a Linux host, wires them to register with the hub, enables linger so they survive reboot. See [Run agents as boot services](#run-agents-as-boot-services).
 
 Out of scope for Phase 1: agent-to-agent delegation, multi-hub federation, DAG workflows, web UI, Prometheus metrics. See [`requirements.md`](./requirements.md) §4.2.
 
@@ -75,6 +77,40 @@ curl -X POST http://localhost:8080/tasks \
   -H "Authorization: Bearer <agent-key>" \
   -H "Content-Type: application/json" \
   -d '{"task":"echo hello world"}'
+```
+
+## Run agents as boot services
+
+On a Linux host where you want claude / codex / opencode adapters to come up automatically at boot and restart on failure, use `scripts/install_agent_services.sh`. It installs three `systemd --user` units, enables linger, and starts them.
+
+```bash
+# On the agent host, as the user that should own the services:
+git clone https://github.com/LI01/AI_Agent_HUB.git ~/work/AI_Agent_HUB
+cd ~/work/AI_Agent_HUB
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+# Mint a registration key from the hub (admin only)
+curl -X POST http://<hub-host>:8300/admin/keys \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"<host>-agents","can_register":true,"can_view_agents":true,"can_view_tasks":true}'
+
+# Install and start the three services (key from env — never on argv)
+AGENT_HUB_API_KEY=<key-from-above> \
+AGENT_HUB_URL=http://<hub-host>:8300 \
+  bash scripts/install_agent_services.sh
+```
+
+Defaults assume the repo is at `$HOME/work/AI_Agent_HUB` and the venv at `$AGENT_HUB_REPO/.venv`. The script auto-detects `claude`, `codex`, and `opencode` CLIs from `$HOME/.local/bin` and `$HOME/.opencode/bin`. Roles default to `reviewer` / `designer` / `tester`; agent IDs default to `<cli>-<role>-$(hostname -s)`. Every default is overridable via env (`AGENT_HUB_REPO`, `AGENT_HUB_VENV`, `AGENT_HUB_WORKDIRS`, `AGENT_ID_SUFFIX`, `ROLE_CLAUDE`, `ROLE_CODEX`, `ROLE_OPENCODE`, `EXTRA_PATH`). The API key is read from `$AGENT_HUB_API_KEY` and written to `~/.config/systemd/user/agent-hub.env` (mode 0600); it never appears in argv.
+
+Day-2 ops:
+
+```bash
+systemctl --user status claude-agent codex-agent opencode-agent
+journalctl --user -u claude-agent -f
+systemctl --user restart codex-agent
+# Rotate the key: edit ~/.config/systemd/user/agent-hub.env, then restart the three services.
 ```
 
 ## Configuration
