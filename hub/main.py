@@ -1226,11 +1226,20 @@ def get_stats(authorization: Optional[str] = Header(None)):
     return db.get_stats()
 
 
+WWW_AUTH = 'Bearer realm="agent-hub"'
+
+
 @app.post("/mcp")
 async def mcp_endpoint(request: Request, authorization: Optional[str] = Header(None)):
     auth_key = get_auth_key(authorization)
-    if not auth_key:
-        raise HTTPException(status_code=403, detail="MCP authentication required")
+    if not auth_key or access_control.validate_key(auth_key) is None:
+        # MCP 2025-03-26 auth § Bearer challenge
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": None,
+             "error": {"code": -32001, "message": "authentication required"}},
+            status_code=401,
+            headers={"WWW-Authenticate": WWW_AUTH},
+        )
     try:
         payload = await request.json()
     except json.JSONDecodeError:

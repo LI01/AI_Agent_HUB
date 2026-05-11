@@ -41,6 +41,7 @@ Thumbs.db
 .claude/
 .agent-comm-state/
 Agent-comm/
+opencode.json
 
 # Logs
 *.log

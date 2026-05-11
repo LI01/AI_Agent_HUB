@@ -79,12 +79,42 @@ CAPABILITY_ROW = {
     "additionalProperties": True,
 }
 CAPABILITY_ROWS = {"type": "array", "items": CAPABILITY_ROW}
+# MCP outputSchema requires a top-level object. The wrapper is the MCP boundary
+# only; REST /capabilities still returns the top-level array (Fix F6).
+CAPABILITY_OUTPUT = {
+    "type": "object",
+    "properties": {"capabilities": CAPABILITY_ROWS},
+    "required": ["capabilities"],
+    "additionalProperties": True,
+}
+
+# Phase 2.5 §4.1: wrap top-level arrays under their natural plural key so
+# `structuredContent` is always a JSON object (MCP spec § Tool result schemas).
+AGENTS_OUTPUT = {
+    "type": "object",
+    "properties": {"agents": {"type": "array", "items": {"type": "object", "additionalProperties": True}}},
+    "required": ["agents"],
+    "additionalProperties": True,
+}
+TASKS_OUTPUT = {
+    "type": "object",
+    "properties": {"tasks": {"type": "array", "items": {"type": "object", "additionalProperties": True}}},
+    "required": ["tasks"],
+    "additionalProperties": True,
+}
+KEYS_OUTPUT = {
+    "type": "object",
+    "properties": {"keys": {"type": "array", "items": {"type": "object", "additionalProperties": True}}},
+    "required": ["keys"],
+    "additionalProperties": True,
+}
 
 
 TOOLS: dict[str, JSON] = {
     "list-agents": {
         "description": "List registered agents visible to the current key.",
         "inputSchema": _object_schema({}),
+        "outputSchema": AGENTS_OUTPUT,
     },
     "get-agent": {
         "description": "Get one registered agent by id.",
@@ -121,7 +151,7 @@ TOOLS: dict[str, JSON] = {
     "list-capabilities": {
         "description": "List capabilities aggregated across online agents.",
         "inputSchema": _object_schema({}),
-        "outputSchema": CAPABILITY_ROWS,
+        "outputSchema": CAPABILITY_OUTPUT,
     },
     "get-task": {
         "description": "Get task status, result, logs, and metadata.",
@@ -130,6 +160,7 @@ TOOLS: dict[str, JSON] = {
     "list-tasks": {
         "description": "List tasks, optionally filtered by status or agent_id.",
         "inputSchema": _object_schema({"status": STRING, "agent_id": STRING}),
+        "outputSchema": TASKS_OUTPUT,
     },
     "stats": {
         "description": "Return aggregate hub stats.",
@@ -155,6 +186,7 @@ TOOLS: dict[str, JSON] = {
     "list-api-keys": {
         "description": "List API key metadata. Requires admin.",
         "inputSchema": _object_schema({}),
+        "outputSchema": KEYS_OUTPUT,
     },
     "revoke-api-key": {
         "description": "Revoke an API key by name. Requires admin.",
@@ -169,9 +201,7 @@ def list_tool_definitions() -> list[JSON]:
             "name": name,
             "description": spec["description"],
             "inputSchema": spec["inputSchema"],
-            "outputSchema": spec.get(
-                "outputSchema", {"type": "object", "additionalProperties": True}
-            ),
+            **({"outputSchema": spec["outputSchema"]} if "outputSchema" in spec else {}),
         }
         for name, spec in TOOLS.items()
     ]
@@ -246,7 +276,7 @@ class InProcessHubBackend(HubBackend):
                 return main.get_task(path.rsplit("/", 1)[-1], self._authorization)
             if method == "GET" and path == "/tasks":
                 params = params or {}
-                return main.list_tasks(params.get("status"), params.get("agent_id"), self._authorization)
+                return main.list_tasks(params.get("status"), params.get("agent_id"), authorization=self._authorization)
             if method == "GET" and path == "/stats":
                 return main.get_stats(self._authorization)
             if method == "GET" and path == "/health":
@@ -302,10 +332,12 @@ async def call_tool(backend: HubBackend, name: str, arguments: Optional[JSON] = 
     args = arguments or {}
 
     if name == "list-agents":
-        return await backend.request("GET", "/agents")
+        # MCP spec § Tool result schemas (structuredContent must be an object).
+        return {"agents": await backend.request("GET", "/agents")}
     if name == "list-capabilities":
-        # Phase 2.2 §3.4: returns the top-level array directly (Fix F6).
-        return await backend.request("GET", "/capabilities")
+        # REST /capabilities returns a top-level array (Fix F6); MCP spec
+        # requires structuredContent to be an object, so wrap at the boundary.
+        return {"capabilities": await backend.request("GET", "/capabilities")}
     if name == "get-agent":
         return await backend.request("GET", f"/agents/{args['agent_id']}")
     if name == "register-agent":
@@ -324,7 +356,8 @@ async def call_tool(backend: HubBackend, name: str, arguments: Optional[JSON] = 
     if name == "get-task":
         return await backend.request("GET", f"/tasks/{args['task_id']}")
     if name == "list-tasks":
-        return await backend.request("GET", "/tasks", params={k: v for k, v in args.items() if v is not None})
+        # MCP spec § Tool result schemas (structuredContent must be an object).
+        return {"tasks": await backend.request("GET", "/tasks", params={k: v for k, v in args.items() if v is not None})}
     if name == "stats":
         return await backend.request("GET", "/stats")
     if name == "health":
@@ -332,7 +365,8 @@ async def call_tool(backend: HubBackend, name: str, arguments: Optional[JSON] = 
     if name == "create-api-key":
         return await backend.request("POST", "/admin/keys", body={k: v for k, v in args.items() if v is not None})
     if name == "list-api-keys":
-        return await backend.request("GET", "/admin/keys")
+        # MCP spec § Tool result schemas (structuredContent must be an object).
+        return {"keys": await backend.request("GET", "/admin/keys")}
     if name == "revoke-api-key":
         return await backend.request("DELETE", f"/admin/keys/{args['name']}")
 

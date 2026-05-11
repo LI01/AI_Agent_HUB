@@ -35,7 +35,7 @@ def _run_tool(name: str, arguments: Optional[dict] = None):
 
 
 def list_agents() -> list:
-    return _run_tool("list-agents")
+    return _run_tool("list-agents")["agents"]
 
 
 def get_agent(agent_id: str) -> dict:
@@ -100,7 +100,7 @@ def list_tasks(status: str = None, agent_id: str = None) -> list:
         args["status"] = status
     if agent_id:
         args["agent_id"] = agent_id
-    return _run_tool("list-tasks", args)
+    return _run_tool("list-tasks", args)["tasks"]
 
 
 def create_api_key(
@@ -122,7 +122,7 @@ def create_api_key(
 
 
 def list_api_keys() -> list:
-    return _run_tool("list-api-keys")
+    return _run_tool("list-api-keys")["keys"]
 
 
 def revoke_api_key(name: str) -> dict:
