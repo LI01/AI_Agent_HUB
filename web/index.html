@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=1280" />
+  <title>Agent Hub</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <style>
+    @keyframes sse-pulse {
+      0%   { box-shadow: 0 0 0 0 rgba(16,185,129,.6); }
+      70%  { box-shadow: 0 0 0 6px rgba(16,185,129,0); }
+      100% { box-shadow: 0 0 0 0 rgba(16,185,129,0); }
+    }
+    .sse-pulse { animation: sse-pulse 1.6s infinite; }
+    html, body { height: 100%; }
+    body { background: #0f172a; color: #e2e8f0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .markdown :is(h1,h2,h3) { font-weight: 600; margin: .6em 0 .3em; }
+    .markdown h1 { font-size: 1.1rem; }
+    .markdown h2 { font-size: 1.0rem; }
+    .markdown h3 { font-size: .95rem; }
+    .markdown p { margin: .4em 0; }
+    .markdown code { background: rgba(148,163,184,.18); padding: 0 .25rem; border-radius: 3px; font-size: .8rem; }
+    .markdown pre { background: rgba(15,23,42,.7); padding: .5rem; border-radius: 4px; overflow-x: auto; font-size: .75rem; }
+    .markdown ul, .markdown ol { margin: .4em 0 .4em 1.2em; }
+    .markdown a { color: #93c5fd; text-decoration: underline; }
+  </style>
+</head>
+<body x-data="hub()" x-init="init()" class="h-screen overflow-hidden">
+
+  <!-- Top bar -->
+  <header id="topbar" class="h-14 flex items-center justify-between border-b border-slate-800 px-4 bg-slate-950">
+    <div class="flex items-center gap-3">
+      <div class="text-base font-semibold tracking-tight">Agent Hub</div>
+      <div class="hidden sm:flex items-center gap-2 text-xs text-slate-400">
+        <span class="px-2 py-0.5 rounded bg-slate-800/70">Agents <span class="text-slate-100 font-medium" x-text="stats?.agents?.total ?? 0"></span></span>
+        <span class="px-2 py-0.5 rounded bg-slate-800/70">Online <span class="text-emerald-400 font-medium" x-text="stats?.agents?.online ?? 0"></span></span>
+        <span class="px-2 py-0.5 rounded bg-slate-800/70">Tasks <span class="text-slate-100 font-medium" x-text="totalTasks()"></span></span>
+        <span class="px-2 py-0.5 rounded bg-slate-800/70">Running <span class="text-amber-400 font-medium" x-text="stats?.tasks?.running ?? 0"></span></span>
+      </div>
+    </div>
+    <div class="flex items-center gap-2 text-xs">
+      <span :class="heartbeatDotClass()" class="inline-block w-2.5 h-2.5 rounded-full" :style="heartbeatDotStyle()"></span>
+      <span class="text-slate-300" x-text="heartbeatLabel()"></span>
+    </div>
+  </header>
+
+  <!-- Three-pane body -->
+  <main class="flex" style="height: calc(100vh - 3.5rem);">
+
+    <!-- Left sidebar: agents -->
+    <aside id="sidebar" class="w-64 shrink-0 border-r border-slate-800 overflow-y-auto bg-slate-950/40">
+      <div class="px-3 py-2 text-[11px] uppercase tracking-wider text-slate-500 sticky top-0 bg-slate-950/80 backdrop-blur">
+        Agents
+        <template x-if="selectedAgent">
+          <button @click="selectedAgent = null" class="ml-2 text-[10px] normal-case text-slate-400 hover:text-slate-200 underline">clear filter</button>
+        </template>
+      </div>
+
+      <template x-if="agents.length === 0 && !loadErrors.agents">
+        <div class="px-3 py-4 text-xs text-slate-500">No agents registered.</div>
+      </template>
+      <template x-if="loadErrors.agents">
+        <div class="px-3 py-4 text-xs text-red-400" x-text="loadErrors.agents"></div>
+      </template>
+
+      <template x-for="agent in sortedAgents()" :key="agent.agent_id">
+        <button
+          @click="toggleAgent(agent.agent_id)"
+          :class="selectedAgent === agent.agent_id ? 'bg-slate-800/80 border-l-2 border-emerald-400' : 'border-l-2 border-transparent hover:bg-slate-800/40'"
+          class="w-full text-left px-3 py-2 flex items-start gap-2 transition-colors"
+          :title="agent.description || ''">
+          <span :class="statusDot(agent.status)" class="inline-block w-2.5 h-2.5 rounded-full mt-1.5 shrink-0"></span>
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center gap-1.5">
+              <span class="text-sm font-medium truncate" x-text="agent.name || agent.agent_id"></span>
+              <template x-if="cliBadge(agent)">
+                <span :class="cliBadge(agent).cls" class="text-[10px] px-1.5 py-0.5 rounded font-medium uppercase tracking-wide text-white"
+                      x-text="cliBadge(agent).label"></span>
+              </template>
+            </div>
+            <div class="text-[11px] text-slate-400 truncate" x-text="agentSubtitle(agent)"></div>
+            <div class="text-[10px] text-slate-500" x-text="'· ' + relTime(agent.last_heartbeat)"></div>
+          </div>
+        </button>
+      </template>
+    </aside>
+
+    <!-- Center: task feed -->
+    <section id="feed" class="flex-1 overflow-y-auto">
+      <div class="px-4 py-2 text-[11px] uppercase tracking-wider text-slate-500 border-b border-slate-800 sticky top-0 bg-slate-950/80 backdrop-blur flex items-center gap-3">
+        <span>Tasks</span>
+        <template x-if="selectedAgent">
+          <span class="text-[11px] normal-case tracking-normal text-emerald-300">filtered by <span x-text="selectedAgent"></span></span>
+        </template>
+      </div>
+
+      <template x-if="loadErrors.tasks">
+        <div class="px-4 py-4 text-xs text-red-400" x-text="loadErrors.tasks"></div>
+      </template>
+
+      <template x-if="!loadErrors.tasks && filteredTasks().length === 0 && tasks.length === 0">
+        <div class="px-4 py-6 text-xs text-slate-500">No tasks yet.</div>
+      </template>
+
+      <template x-if="!loadErrors.tasks && filteredTasks().length === 0 && tasks.length > 0 && selectedAgent">
+        <div class="px-4 py-6 text-xs text-slate-500">
+          No tasks for <span x-text="selectedAgent"></span>.
+          <button @click="selectedAgent = null" class="ml-2 underline text-emerald-300">Clear filter</button>
+        </div>
+      </template>
+
+      <template x-for="t in filteredTasks()" :key="t.task_id">
+        <button @click="selectTask(t.task_id)"
+          :class="selectedTaskId === t.task_id ? 'bg-slate-800/60' : 'hover:bg-slate-800/30'"
+          class="w-full text-left px-4 py-3 border-b border-slate-800/60 flex items-start gap-3">
+          <span :class="statusDot(t.status)" class="inline-block w-2.5 h-2.5 rounded-full mt-1.5 shrink-0"></span>
+          <div class="flex-1 min-w-0">
+            <div class="text-sm text-slate-100 truncate" x-text="truncate(t.task || t.task_type || '(loading…)', 60)"></div>
+            <div class="text-[11px] text-slate-400 mt-0.5 flex items-center gap-2">
+              <span class="px-1.5 py-0.5 rounded bg-slate-800/80 text-slate-300" x-text="t.assigned_agent_id || t.target_agent || 'unassigned'"></span>
+              <span x-text="t.task_type"></span>
+              <span class="text-slate-600">·</span>
+              <span x-text="relTime(t.created_at)"></span>
+            </div>
+          </div>
+          <span class="text-[10px] px-1.5 py-0.5 rounded uppercase tracking-wide text-slate-300 bg-slate-800/80" x-text="t.status"></span>
+        </button>
+      </template>
+    </section>
+
+    <!-- Right: task detail -->
+    <aside id="detail" class="w-96 shrink-0 border-l border-slate-800 overflow-y-auto bg-slate-950/40">
+      <template x-if="!selectedTask">
+        <div class="px-4 py-10 text-xs text-slate-500 text-center">Select a task to view details.</div>
+      </template>
+
+      <template x-if="selectedTask">
+        <div class="px-4 py-3 text-xs">
+          <div class="flex items-center gap-2 mb-2">
+            <span :class="statusDot(selectedTask.status)" class="inline-block w-2.5 h-2.5 rounded-full"></span>
+            <span class="font-semibold text-slate-100" x-text="selectedTask.task_type"></span>
+            <span class="ml-auto text-[10px] px-1.5 py-0.5 rounded uppercase tracking-wide text-slate-300 bg-slate-800/80" x-text="selectedTask.status"></span>
+          </div>
+
+          <div class="flex items-center gap-1 mb-3">
+            <code class="text-[10px] text-slate-400 truncate" x-text="selectedTask.task_id"></code>
+            <button @click="copyId(selectedTask.task_id)" class="text-[10px] text-emerald-300 hover:text-emerald-200 underline ml-auto" x-text="copyLabel"></button>
+          </div>
+
+          <div class="text-sm text-slate-200 mb-3" x-text="selectedTask.task"></div>
+
+          <table class="w-full text-[11px] mb-3">
+            <tbody class="divide-y divide-slate-800/60">
+              <tr><td class="py-1 pr-2 text-slate-500">submitted_by</td><td class="py-1 text-slate-200" x-text="selectedTask.submitted_by || '—'"></td></tr>
+              <tr><td class="py-1 pr-2 text-slate-500">target_agent</td><td class="py-1 text-slate-200" x-text="selectedTask.target_agent || '—'"></td></tr>
+              <tr><td class="py-1 pr-2 text-slate-500">assigned_agent_id</td><td class="py-1 text-slate-200" x-text="selectedTask.assigned_agent_id || '—'"></td></tr>
+              <tr><td class="py-1 pr-2 text-slate-500">created_at</td><td class="py-1 text-slate-200" x-text="selectedTask.created_at || '—'"></td></tr>
+              <tr><td class="py-1 pr-2 text-slate-500">started_at</td><td class="py-1 text-slate-200" x-text="selectedTask.started_at || '—'"></td></tr>
+              <tr><td class="py-1 pr-2 text-slate-500">completed_at</td><td class="py-1 text-slate-200" x-text="selectedTask.completed_at || '—'"></td></tr>
+              <tr><td class="py-1 pr-2 text-slate-500">timeout</td><td class="py-1 text-slate-200" x-text="(selectedTask.timeout ?? '—') + 's'"></td></tr>
+            </tbody>
+          </table>
+
+          <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1">Payload</div>
+          <pre class="text-xs overflow-x-auto max-h-96 bg-slate-900/70 rounded p-2 mb-3 whitespace-pre-wrap break-words" x-text="prettyJson(selectedTask.payload)"></pre>
+
+          <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1">Result</div>
+          <div class="mb-3">
+            <template x-if="resultIsMarkdown(selectedTask.result)">
+              <div class="markdown text-xs text-slate-100" x-html="renderMarkdown(selectedTask.result.text)"></div>
+            </template>
+            <template x-if="!resultIsMarkdown(selectedTask.result) && selectedTask.result != null">
+              <pre class="text-xs overflow-x-auto max-h-96 bg-slate-900/70 rounded p-2 whitespace-pre-wrap break-words" x-text="prettyJson(selectedTask.result)"></pre>
+            </template>
+            <template x-if="selectedTask.result == null">
+              <div class="text-xs text-slate-500 italic">(no result yet)</div>
+            </template>
+          </div>
+
+          <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1">Logs</div>
+          <template x-if="(selectedTask.logs || []).length === 0">
+            <div class="text-xs text-slate-500 italic">(no logs)</div>
+          </template>
+          <template x-if="(selectedTask.logs || []).length > 0">
+            <pre class="text-xs overflow-x-auto max-h-96 bg-slate-900/70 rounded p-2 whitespace-pre-wrap break-words" x-text="(selectedTask.logs || []).join('\n')"></pre>
+          </template>
+        </div>
+      </template>
+    </aside>
+  </main>
+
+  <script>
+    function hub() {
+      return {
+        // ----- state -----
+        agents: [],
+        tasks: [],
+        stats: null,
+        selectedAgent: null,
+        selectedTaskId: null,
+        loadErrors: { agents: null, tasks: null, stats: null },
+        lastEventAt: Date.now(),
+        liveSince: null,
+        sseState: 'connecting', // connecting | live | reconnecting
+        nowTick: Date.now(),
+        copyLabel: 'copy id',
+        _ssePreloadBuffer: [],
+        _ssePreloadReady: false,
+        _es: null,
+
+        get selectedTask() {
+          if (!this.selectedTaskId) return null;
+          return this.tasks.find(t => t.task_id === this.selectedTaskId) || null;
+        },
+
+        // ----- init / load -----
+        init() {
+          // 1. open EventSource FIRST, buffer events until initial fetches resolve.
+          this.openSSE();
+          // 2. parallel fetch of /agents, /tasks, /stats.
+          Promise.allSettled([
+            this.fetchAgents(),
+            this.fetchTasks(),
+            this.fetchStats(),
+          ]).then(() => {
+            // 3. flush buffered SSE events against loaded state.
+            this._ssePreloadReady = true;
+            const buf = this._ssePreloadBuffer;
+            this._ssePreloadBuffer = [];
+            for (const msg of buf) this.applyEvent(msg);
+          });
+          // 4. heartbeat tick for relative time + staleness.
+          setInterval(() => { this.nowTick = Date.now(); }, 1000);
+        },
+
+        async fetchAgents() {
+          try {
+            const r = await fetch('/agents', { credentials: 'same-origin' });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            this.agents = await r.json();
+          } catch (e) {
+            this.loadErrors.agents = 'could not load agents — check Cloudflare Access session';
+          }
+        },
+        async fetchTasks() {
+          try {
+            const r = await fetch('/tasks', { credentials: 'same-origin' });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            this.tasks = await r.json();
+          } catch (e) {
+            this.loadErrors.tasks = 'could not load tasks — check Cloudflare Access session';
+          }
+        },
+        async fetchStats() {
+          try {
+            const r = await fetch('/stats', { credentials: 'same-origin' });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            this.stats = await r.json();
+          } catch (e) {
+            this.loadErrors.stats = 'could not load stats';
+          }
+        },
+        async fetchTaskById(id) {
+          try {
+            const r = await fetch('/tasks/' + encodeURIComponent(id), { credentials: 'same-origin' });
+            if (!r.ok) return null;
+            return await r.json();
+          } catch (e) { return null; }
+        },
+
+        // ----- SSE -----
+        openSSE() {
+          const es = new EventSource('/events');
+          this._es = es;
+          es.onopen = () => {
+            this.sseState = 'live';
+            this.lastEventAt = Date.now();
+          };
+          es.onmessage = (ev) => {
+            this.lastEventAt = Date.now();
+            this.sseState = 'live';
+            let msg;
+            try { msg = JSON.parse(ev.data); } catch { return; }
+            if (!this._ssePreloadReady) {
+              this._ssePreloadBuffer.push(msg);
+              return;
+            }
+            this.applyEvent(msg);
+          };
+          es.onerror = () => {
+            // Do NOT close + recreate; the browser auto-retries.
+            this.sseState = 'reconnecting';
+          };
+        },
+
+        applyEvent(msg) {
+          if (!msg || !msg.type) return;
+          const d = msg.data || {};
+          switch (msg.type) {
+            case 'connected':           this.liveSince = Date.now(); break;
+            case 'agent_registered':    this.onAgentRegistered(d); break;
+            case 'agent_status':        this.onAgentStatus(d); break;
+            case 'agent_unregistered':  this.onAgentUnregistered(d); break;
+            case 'task_created':        this.onTaskCreated(d); break;
+            case 'task_updated':        this.onTaskUpdated(d); break;
+            case 'task_completed':      this.onTaskCompleted(d); break;
+          }
+        },
+
+        onAgentRegistered(d) {
+          if (!d.agent_id) return;
+          const idx = this.agents.findIndex(a => a.agent_id === d.agent_id);
+          const stub = {
+            agent_id: d.agent_id,
+            name: d.agent_id,
+            capabilities: d.capabilities || [],
+            status: 'idle',
+            last_heartbeat: new Date().toISOString(),
+            machine_info: { platform: 'unknown' },
+          };
+          if (idx >= 0) this.agents[idx] = { ...this.agents[idx], ...stub, name: this.agents[idx].name || stub.name };
+          else this.agents.push(stub);
+        },
+        onAgentStatus(d) {
+          if (!d.agent_id) return;
+          const a = this.agents.find(x => x.agent_id === d.agent_id);
+          if (!a) return;
+          a.status = d.status;
+          a.last_heartbeat = new Date().toISOString();
+        },
+        onAgentUnregistered(d) {
+          this.agents = this.agents.filter(a => a.agent_id !== d.agent_id);
+          if (this.selectedAgent === d.agent_id) this.selectedAgent = null;
+        },
+        async onTaskCreated(d) {
+          if (!d.task_id) return;
+          if (this.tasks.find(t => t.task_id === d.task_id)) return; // already there (race w/ backfill)
+          // optimistic stub, then backfill
+          this.tasks.unshift({
+            task_id: d.task_id,
+            task: '',
+            task_type: d.task_type || '',
+            submitted_by: d.submitted_by || null,
+            target_agent: null,
+            assigned_agent_id: null,
+            status: 'queued',
+            created_at: new Date().toISOString(),
+            payload: {},
+            result: null,
+            logs: [],
+          });
+          const full = await this.fetchTaskById(d.task_id);
+          if (full) {
+            const i = this.tasks.findIndex(t => t.task_id === d.task_id);
+            if (i >= 0) this.tasks[i] = { ...this.tasks[i], ...full };
+          }
+        },
+        async onTaskUpdated(d) {
+          if (!d.task_id) return;
+          const i = this.tasks.findIndex(t => t.task_id === d.task_id);
+          if (i < 0) {
+            const full = await this.fetchTaskById(d.task_id);
+            if (full) this.tasks.unshift(full);
+            return;
+          }
+          const t = this.tasks[i];
+          if (d.status !== undefined) t.status = d.status;
+          if (d.agent_id !== undefined) t.assigned_agent_id = d.agent_id;
+          if (d.result !== undefined) t.result = d.result;
+          if (d.log !== undefined) {
+            t.logs = t.logs || [];
+            t.logs.push(d.log);
+          }
+        },
+        onTaskCompleted(d) {
+          if (!d.task_id) return;
+          const i = this.tasks.findIndex(t => t.task_id === d.task_id);
+          if (i < 0) { this.onTaskUpdated(d); return; }
+          const t = this.tasks[i];
+          t.status = d.status || 'completed';
+          if (d.result !== undefined) t.result = d.result;
+          t.completed_at = t.completed_at || new Date().toISOString();
+        },
+
+        // ----- interaction -----
+        toggleAgent(id) {
+          this.selectedAgent = (this.selectedAgent === id) ? null : id;
+        },
+        selectTask(id) {
+          this.selectedTaskId = id;
+          this.copyLabel = 'copy id';
+          // If the in-memory copy lacks result/logs, fetch the full record.
+          const t = this.tasks.find(x => x.task_id === id);
+          if (t && (t.result === undefined || t.logs === undefined)) {
+            this.fetchTaskById(id).then(full => {
+              if (!full) return;
+              const idx = this.tasks.findIndex(x => x.task_id === id);
+              if (idx >= 0) this.tasks[idx] = { ...this.tasks[idx], ...full };
+            });
+          }
+        },
+        copyId(id) {
+          try {
+            navigator.clipboard.writeText(id);
+            this.copyLabel = 'copied!';
+            setTimeout(() => { this.copyLabel = 'copy id'; }, 1200);
+          } catch {
+            this.copyLabel = 'copy failed';
+          }
+        },
+
+        // ----- derived -----
+        totalTasks() {
+          const t = this.stats?.tasks;
+          if (!t) return 0;
+          return Object.values(t).reduce((a, b) => a + (Number(b) || 0), 0);
+        },
+        sortedAgents() {
+          const order = { busy: 0, idle: 1, offline: 2 };
+          return [...this.agents].sort((a, b) => {
+            const oa = order[a.status] ?? 3, ob = order[b.status] ?? 3;
+            if (oa !== ob) return oa - ob;
+            return (a.name || a.agent_id).localeCompare(b.name || b.agent_id);
+          });
+        },
+        filteredTasks() {
+          const arr = this.selectedAgent
+            ? this.tasks.filter(t => t.assigned_agent_id === this.selectedAgent || t.target_agent === this.selectedAgent)
+            : this.tasks;
+          return [...arr].sort((a, b) => {
+            const av = a.created_at || '', bv = b.created_at || '';
+            return bv.localeCompare(av);
+          });
+        },
+
+        // ----- presentation helpers -----
+        statusDot(status) {
+          switch (status) {
+            case 'idle':
+            case 'completed': return 'bg-green-500';
+            case 'busy':
+            case 'running':   return 'bg-amber-500';
+            case 'offline':   return 'bg-slate-400';
+            case 'failed':
+            case 'timeout':   return 'bg-red-500';
+            case 'queued':    return 'bg-blue-400';
+            case 'assigned':  return 'bg-blue-400';
+            default:          return 'bg-slate-500';
+          }
+        },
+        cliBadge(agent) {
+          const id = (agent.agent_id || '').toLowerCase();
+          if (id.startsWith('claude'))   return { label: 'claude',   cls: 'bg-teal-500' };
+          if (id.startsWith('codex'))    return { label: 'codex',    cls: 'bg-violet-500' };
+          if (id.startsWith('opencode')) return { label: 'opencode', cls: 'bg-orange-500' };
+          return null;
+        },
+        agentSubtitle(a) {
+          const mi = a.machine_info || {};
+          return mi.hostname || mi.ip || mi.platform || '';
+        },
+        truncate(s, n) {
+          s = s || '';
+          return s.length > n ? s.slice(0, n - 1) + '…' : s;
+        },
+        relTime(iso) {
+          if (!iso) return '—';
+          const t = new Date(iso).getTime();
+          if (isNaN(t)) return iso;
+          const s = Math.max(0, Math.floor((this.nowTick - t) / 1000));
+          if (s < 60) return s + 's ago';
+          const m = Math.floor(s / 60);
+          if (m < 60) return m + 'm ago';
+          const h = Math.floor(m / 60);
+          if (h < 24) return h + 'h ago';
+          return Math.floor(h / 24) + 'd ago';
+        },
+        prettyJson(v) {
+          if (v === null || v === undefined) return '';
+          try { return JSON.stringify(v, null, 2); }
+          catch { return String(v); }
+        },
+        resultIsMarkdown(r) {
+          return r && typeof r === 'object' && typeof r.text === 'string';
+        },
+        renderMarkdown(text) {
+          try {
+            return DOMPurify.sanitize(marked.parse(text || ''));
+          } catch (e) {
+            return DOMPurify.sanitize(String(text || ''));
+          }
+        },
+
+        // ----- heartbeat pill -----
+        heartbeatDelta() { return this.nowTick - this.lastEventAt; },
+        heartbeatLabel() {
+          const delta = this.heartbeatDelta();
+          const s = Math.max(0, Math.floor(delta / 1000));
+          if (this.sseState === 'reconnecting' && delta < 30000) return 'Reconnecting…';
+          if (delta < 30000) return 'Live · ' + s + 's ago';
+          return 'Stale · ' + s + 's ago';
+        },
+        heartbeatDotClass() {
+          const delta = this.heartbeatDelta();
+          if (this.sseState === 'reconnecting' && delta < 30000) return 'bg-slate-400';
+          if (delta < 30000) return 'bg-green-500 sse-pulse';
+          return 'bg-amber-500';
+        },
+        heartbeatDotStyle() { return ''; },
+      };
+    }
+  </script>
+</body>
+</html>

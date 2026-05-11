@@ -2,13 +2,15 @@ import asyncio
 import json
 import os
 import contextlib
+import pathlib
 import uuid
 from datetime import datetime
 from typing import Dict, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse as EventStreamResponse
 
@@ -1370,3 +1372,23 @@ def revoke_api_key(key_name: str, authorization: Optional[str] = Header(None)):
     if access_control.revoke_key(key_name):
         return {"status": "revoked", "name": key_name}
     raise HTTPException(status_code=404, detail="Key not found")
+
+
+# --- Dashboard static mount (phase dashboard-v1) ---
+# Unconditional `/` -> `/ui/` redirect, registered even when `web/` is absent
+# so a missing SPA bundle still produces a redirect from the root URL.
+@app.get("/")
+def _root():
+    return RedirectResponse("/ui/", status_code=307)
+
+
+WEB_DIR = pathlib.Path(__file__).resolve().parent.parent / "web"
+if WEB_DIR.exists():
+    # Explicit SPA route registered BEFORE the StaticFiles mount so the bare
+    # trailing-slash URL serves index.html rather than getting 404'd by
+    # StaticFiles (which does not serve directory indexes when html=False).
+    @app.get("/ui/")
+    def _ui_index():
+        return FileResponse(WEB_DIR / "index.html", media_type="text/html")
+
+    app.mount("/ui", StaticFiles(directory=str(WEB_DIR), html=False), name="ui")

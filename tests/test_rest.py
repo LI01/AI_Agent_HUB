@@ -829,3 +829,56 @@ def test_p22_rte_3_direct_target_capability_check(
         )
         count = cur.fetchone()[0]
     assert count >= 1, "expected direct_target_capability_mismatch activity log entry"
+
+
+# === I-UI: Dashboard static mount (phase dashboard-v1) ===
+
+def test_i_ui_1_ui_index_served(client):
+    """GET /ui/ returns 200 text/html containing 'Agent Hub'."""
+    r = client.get("/ui/")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    assert "Agent Hub" in r.text
+
+
+def test_i_ui_2_root_redirects_to_ui_when_web_absent(monkeypatch, tmp_db):
+    """GET / returns 307 -> /ui/ even when web/ is absent at import time.
+
+    Regression test for the redirect-outside-guard fix: monkeypatch
+    pathlib.Path.exists to return False for the repo's web/ directory,
+    re-import hub.main so the import-time WEB_DIR.exists() check sees False,
+    then assert the unconditional / -> /ui/ redirect still fires AND
+    /ui/ itself returns 404 (proving the SPA mount was correctly skipped)."""
+    import importlib, sys, pathlib
+    real_exists = pathlib.Path.exists
+
+    def fake_exists(self):
+        # Match the exact WEB_DIR computed by hub/main.py:
+        #   pathlib.Path(<hub/main.py>).resolve().parent.parent / "web"
+        # i.e. the "web" directory whose parent is the agent-hub repo root.
+        if self.name == "web" and self.parent.name == "agent-hub":
+            return False
+        return real_exists(self)
+
+    monkeypatch.setattr(pathlib.Path, "exists", fake_exists)
+    for mod in list(sys.modules):
+        if mod == "hub" or mod.startswith("hub."):
+            del sys.modules[mod]
+    hub_main = importlib.import_module("hub.main")
+    from fastapi.testclient import TestClient
+    c = TestClient(hub_main.app)
+
+    # The unconditional redirect must fire.
+    r = c.get("/", follow_redirects=False)
+    assert r.status_code == 307
+    assert r.headers["location"] == "/ui/"
+
+    # And the SPA route must be absent (proving WEB_DIR.exists() saw False).
+    r2 = c.get("/ui/")
+    assert r2.status_code == 404
+
+
+def test_i_ui_3_missing_asset_404(client):
+    """GET /ui/some-missing-asset returns 404 (StaticFiles default)."""
+    r = client.get("/ui/does-not-exist.css")
+    assert r.status_code == 404
