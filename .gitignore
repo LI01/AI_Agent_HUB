@@ -43,6 +43,11 @@ Thumbs.db
 Agent-comm/
 opencode.json
 
+# Secrets
+.env
+.env.local
+.env.*.local
+
 # Logs
 *.log
 /tmp/
