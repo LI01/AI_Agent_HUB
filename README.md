@@ -193,6 +193,7 @@ Two macOS-specific gotchas:
 | `WS`   | `/ws` | `auth_token` in first frame | Persistent agent connection. |
 | `POST` | `/tasks` | `can_assign_tasks` | Submit a task. |
 | `GET`  | `/tasks/{id}` | `can_view_tasks` | Get task status, result, logs. |
+| `POST` | `/tasks/{id}/cancel` | `can_assign_tasks` | Cancel a non-terminal task. Marks failed with `result.error="cancelled"`. 404 if not found, 409 if already terminal. |
 | `GET`  | `/tasks?status=&agent_id=` | `can_view_tasks` | List tasks with optional filters. |
 | `GET`  | `/agents` | `can_view_agents` | List agents. |
 | `GET`  | `/agents/{id}` | `can_view_agents` | Get agent details. |

@@ -1150,6 +1150,33 @@ def get_task(task_id: str, authorization: Optional[str] = Header(None)):
     return task
 
 
+@app.post("/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str, authorization: Optional[str] = Header(None)):
+    """Cancel a non-terminal task. Marks it FAILED with `result.error="cancelled"`.
+
+    A task already cancelled while assigned/running stays in the agent's
+    process until the agent finishes naturally; the late result is dropped
+    by `finalize_task`'s terminal-status guard.
+    """
+    require_assign(authorization)
+    task = queue.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status in TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task is already terminal (status={task.status.value})",
+        )
+    ok = await finalize_task(
+        task_id,
+        TaskStatus.FAILED,
+        result={"error": "cancelled", "cancelled_via": "api"},
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to cancel task")
+    return {"status": "cancelled", "task_id": task_id}
+
+
 @app.get("/tasks")
 def list_tasks(
     status: Optional[str] = None,

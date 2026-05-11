@@ -157,6 +157,10 @@ TOOLS: dict[str, JSON] = {
         "description": "Get task status, result, logs, and metadata.",
         "inputSchema": _object_schema({"task_id": STRING}, ["task_id"]),
     },
+    "cancel-task": {
+        "description": "Cancel a non-terminal task. Marks it failed with error='cancelled'.",
+        "inputSchema": _object_schema({"task_id": STRING}, ["task_id"]),
+    },
     "list-tasks": {
         "description": "List tasks, optionally filtered by status or agent_id.",
         "inputSchema": _object_schema({"status": STRING, "agent_id": STRING}),
@@ -272,6 +276,8 @@ class InProcessHubBackend(HubBackend):
                 return main.unregister_agent((body or {})["agent_id"], self._authorization)
             if method == "POST" and path == "/tasks":
                 return await main.submit_task(TaskSubmitRequest(**(body or {})), self._authorization)
+            if method == "POST" and path.startswith("/tasks/") and path.endswith("/cancel"):
+                return await main.cancel_task(path.split("/")[2], self._authorization)
             if method == "GET" and path.startswith("/tasks/"):
                 return main.get_task(path.rsplit("/", 1)[-1], self._authorization)
             if method == "GET" and path == "/tasks":
@@ -355,6 +361,8 @@ async def call_tool(backend: HubBackend, name: str, arguments: Optional[JSON] = 
         return await backend.request("POST", "/tasks", body={k: v for k, v in args.items() if v is not None})
     if name == "get-task":
         return await backend.request("GET", f"/tasks/{args['task_id']}")
+    if name == "cancel-task":
+        return await backend.request("POST", f"/tasks/{args['task_id']}/cancel")
     if name == "list-tasks":
         # MCP spec § Tool result schemas (structuredContent must be an object).
         return {"tasks": await backend.request("GET", "/tasks", params={k: v for k, v in args.items() if v is not None})}

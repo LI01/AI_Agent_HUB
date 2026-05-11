@@ -103,6 +103,58 @@ def test_i_tsk_6_priority_dispatch_order(client, agent_headers, submitter_key):
         assert high_task["started_at"] <= low_task["started_at"], "high priority must be assigned first"
 
 
+# === I-CAN: Task cancellation ===
+
+def test_i_can_1_cancel_queued_task_returns_200(client, agent_headers):
+    """POST /tasks/{id}/cancel on a queued task marks it failed with
+    result.error='cancelled'."""
+    r = client.post("/tasks", headers=agent_headers, json={
+        "task": "x", "task_type": "nobody-handles-this", "target_agent": "ghost"
+    })
+    tid = r.json()["task_id"]
+    assert client.get(f"/tasks/{tid}", headers=agent_headers).json()["status"] == "queued"
+
+    c = client.post(f"/tasks/{tid}/cancel", headers=agent_headers)
+    assert c.status_code == 200
+    assert c.json() == {"status": "cancelled", "task_id": tid}
+
+    after = client.get(f"/tasks/{tid}", headers=agent_headers).json()
+    assert after["status"] == "failed"
+    assert after["result"]["error"] == "cancelled"
+
+
+def test_i_can_2_cancel_unknown_task_returns_404(client, agent_headers):
+    r = client.post("/tasks/does-not-exist/cancel", headers=agent_headers)
+    assert r.status_code == 404
+
+
+def test_i_can_3_cancel_already_terminal_returns_409(client, agent_headers):
+    r = client.post("/tasks", headers=agent_headers, json={
+        "task": "x", "task_type": "nobody-handles-this", "target_agent": "ghost"
+    })
+    tid = r.json()["task_id"]
+    assert client.post(f"/tasks/{tid}/cancel", headers=agent_headers).status_code == 200
+
+    second = client.post(f"/tasks/{tid}/cancel", headers=agent_headers)
+    assert second.status_code == 409
+
+
+def test_i_can_4_cancel_without_assign_perm_returns_403(client, agent_headers, admin_headers):
+    """Cancel requires can_assign_tasks (same as submit)."""
+    r = client.post("/tasks", headers=agent_headers, json={
+        "task": "x", "task_type": "nobody-handles-this", "target_agent": "ghost"
+    })
+    tid = r.json()["task_id"]
+
+    viewer = client.post("/admin/keys", headers=admin_headers, json={
+        "name": "viewer-only", "can_view_tasks": True
+    }).json()["api_key"]
+    viewer_h = {"Authorization": f"Bearer {viewer}"}
+
+    c = client.post(f"/tasks/{tid}/cancel", headers=viewer_h)
+    assert c.status_code == 403
+
+
 # === I-QRY: Queries (test_plan §3.3) ===
 
 def test_i_qry_1_get_task_returns_status(client, agent_headers):

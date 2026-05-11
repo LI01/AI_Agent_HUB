@@ -119,6 +119,20 @@ curl "http://localhost:8080/tasks?status=running" -H "Authorization: Bearer $YOU
 curl "http://localhost:8080/tasks?agent_id=worker-1" -H "Authorization: Bearer $YOUR_KEY"
 ```
 
+### 1.5b Cancel a task
+
+```bash
+curl -X POST http://localhost:8080/tasks/$TASK_ID/cancel \
+  -H "Authorization: Bearer $YOUR_KEY"
+# {"status":"cancelled","task_id":"..."}
+```
+
+Marks the task `failed` with `result.error="cancelled"`. Works on tasks in any non-terminal state — `queued`, `assigned`, or `running`. 404 if the task ID doesn't exist; 409 if already `completed` / `failed` / `timeout`.
+
+Caveat: cancelling an `assigned` or `running` task doesn't notify the agent. The agent finishes its work; the late result is dropped by the hub's terminal-status guard. Useful for clearing queued tasks that no agent will ever pick up (wrong `task_type`, target offline forever, etc.).
+
+Permission: `can_assign_tasks` (same scope as submitting).
+
 ### 1.6 Watch live events
 
 Server-Sent Events for real-time task and agent updates:
@@ -175,6 +189,7 @@ AGENT_HUB_API_KEY=$YOUR_KEY \
 | `unregister-agent` | Remove an agent. |
 | `submit-task` | Submit a task. Same fields as `POST /tasks`: `task`, `task_type`, `payload`, `target_agent`, `priority`, `timeout`, `parent_task_id`. |
 | `get-task` | Get task status, result, logs. |
+| `cancel-task` | Cancel a non-terminal task by id. Marks it failed with `error='cancelled'`. |
 | `list-tasks` | Filter by `status` and/or `agent_id`. |
 | `stats` | Aggregate counts. |
 | `health` | Hub health check. |
