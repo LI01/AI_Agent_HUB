@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -307,6 +308,13 @@ def main(argv: list[str] | None = None) -> None:
             role=args.role,
             hub=agent,
         )
+
+    def _shutdown(_signum, _frame):
+        agent.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
 
     print(
         f"[clients.codex.llm_agent] starting agent_id={args.id} "
