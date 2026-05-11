@@ -113,6 +113,60 @@ systemctl --user restart codex-agent
 # Rotate the key: edit ~/.config/systemd/user/agent-hub.env, then restart the three services.
 ```
 
+### Adapter env vars
+
+The shared `~/.config/systemd/user/agent-hub.env` accepts these:
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `AGENT_HUB_API_KEY` | (required) | Registration key. Must have `can_register`. |
+| `AGENT_HUB_URL` | `http://10.9.0.10:8300` | Hub URL. |
+| `AGENT_HUB_CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS` | unset | If `1`, claude adapter passes `--dangerously-skip-permissions` to `claude -p`, letting it use Bash/Edit/WebSearch/WebFetch without interactive confirmation. **Without this, the claude adapter has effectively no tools** in headless mode (codex/opencode are unaffected). Recommended only for trusted hub deployments. |
+
+### Run on macOS at login (launchd)
+
+For a Mac that hosts the hub itself (or adapters), use a `~/Library/LaunchAgents/<label>.plist` with `RunAtLoad=true` + `KeepAlive=true`. Minimal hub plist:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>ai.openclaw.agent-hub</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>WorkingDirectory</key><string>/Users/you/agent-hub</string>
+  <key>ProgramArguments</key><array>
+    <string>/Users/you/agent-hub/venv/bin/python</string>
+    <string>-m</string><string>uvicorn</string>
+    <string>hub.main:app</string>
+    <string>--host</string><string>0.0.0.0</string>
+    <string>--port</string><string>8300</string>
+  </array>
+  <key>StandardOutPath</key><string>/Users/you/.openclaw/logs/agent-hub.log</string>
+  <key>StandardErrorPath</key><string>/Users/you/.openclaw/logs/agent-hub.err.log</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>HOME</key><string>/Users/you</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+  </dict>
+</dict></plist>
+```
+
+Load / verify / unload:
+
+```bash
+launchctl bootstrap   gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.agent-hub.plist
+launchctl print       gui/$(id -u)/ai.openclaw.agent-hub | grep -E 'state|pid|exit'
+launchctl kickstart -k gui/$(id -u)/ai.openclaw.agent-hub   # restart
+launchctl bootout     gui/$(id -u)/ai.openclaw.agent-hub
+```
+
+Two macOS-specific gotchas:
+
+- **TCC blocks `/Volumes`.** Launchd-spawned processes can't read external volumes (`/Volumes/<anything>`) by default — Python startup hangs in `open()` and `ls` returns `Operation not permitted`. Keep the project, venv, and DB on the boot volume (e.g. under `/Users/<you>/`). To override, grant the binary Full Disk Access in System Settings → Privacy & Security.
+- **LaunchAgent vs LaunchDaemon.** `~/Library/LaunchAgents/` runs only when the user is logged in. For headless boot (no login), put the plist under `/Library/LaunchDaemons/` instead and adjust paths.
+
 ## Configuration
 
 | Env var | Default | Purpose |

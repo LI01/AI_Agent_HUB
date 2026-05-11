@@ -551,6 +551,48 @@ Each gets its own subprocess, workspace, and `agent_id`. They'll show up indepen
 
 For "always-online" deployment, wrap each spawn in a `systemd` unit (Linux) / launchd plist (macOS) / Windows Service so they restart on crash and survive reboot. The SDK's default `reconnect=True` already handles transient hub disconnects — the supervisor only needs to deal with process crashes.
 
+**macOS launchd recipe.** A `~/Library/LaunchAgents/<label>.plist` with `RunAtLoad=true` + `KeepAlive=true` autostarts the hub (or any adapter) at user login and restarts on crash. Minimal example for the hub itself:
+
+```xml
+<plist version="1.0"><dict>
+  <key>Label</key><string>ai.openclaw.agent-hub</string>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>WorkingDirectory</key><string>/Users/you/agent-hub</string>
+  <key>ProgramArguments</key><array>
+    <string>/Users/you/agent-hub/venv/bin/python</string>
+    <string>-m</string><string>uvicorn</string>
+    <string>hub.main:app</string>
+    <string>--host</string><string>0.0.0.0</string><string>--port</string><string>8300</string>
+  </array>
+  <key>StandardOutPath</key><string>/Users/you/.openclaw/logs/agent-hub.log</string>
+  <key>StandardErrorPath</key><string>/Users/you/.openclaw/logs/agent-hub.err.log</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+  </dict>
+</dict></plist>
+```
+
+```bash
+launchctl bootstrap   gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.agent-hub.plist
+launchctl kickstart -k gui/$(id -u)/ai.openclaw.agent-hub   # restart
+launchctl bootout     gui/$(id -u)/ai.openclaw.agent-hub
+```
+
+**Two macOS gotchas to avoid:**
+
+- **TCC blocks `/Volumes`.** Launchd-spawned processes get `Operation not permitted` on external volumes — Python startup hangs in `open()` with no error in the log. Put the project, venv, and DB on the boot volume (`/Users/<you>/...`), or grant the binary Full Disk Access in System Settings → Privacy & Security.
+- **LaunchAgent only runs while you're logged in.** For headless boot, put the plist under `/Library/LaunchDaemons/` instead.
+
+### 2.9.5b Tool access for the claude adapter
+
+`claude -p` (the headless mode the claude adapter uses) **rejects tool use without interactive confirmation by default**. So a freshly spawned `claude-*` agent has Bash / Edit / Write / WebSearch / WebFetch present but unusable — it will respond as if it has no tools (e.g. "I can't check live weather, I don't have a tool for that"). Codex and OpenCode adapters are unaffected; their CLIs auto-approve their built-in tools.
+
+Opt in by setting `AGENT_HUB_CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS=1` in the adapter's environment — the adapter then passes `--dangerously-skip-permissions` to `claude -p`. For systemd installs, append it to `~/.config/systemd/user/agent-hub.env` (it's a no-op for codex/opencode units sharing that file) and `systemctl --user restart claude-agent`. For launchd, add it under `EnvironmentVariables` in the plist.
+
+Even with the flag on, claude is more conservative than codex/opencode about reaching for tools on bare prompts. If you need it to use WebSearch/WebFetch reliably, either nudge in the user prompt ("Use WebSearch to look up …") or set a role system prompt via `--system-prompt-extra` / `role_prompts` in `~/.agent-hub/config.json` that tells it to.
+
 ### 2.9.6 Roles + system prompts at a glance
 
 | Role | Capabilities | Default budget | System prompt |
@@ -692,6 +734,8 @@ Register N agents with overlapping capabilities for parallelism. The hub assigns
 | Task delivered to wrong agent | You used capability matching with overlapping agents. | Use `target_agent` for direct routing. |
 | Agent dropped after restart | Expected — agents must reconnect. | Run with auto-reconnect (`reconnect=True`, the SDK default). |
 | `database is locked` | Concurrent writes saturating SQLite. | Already on WAL mode; if persistent, reduce write rate or move to PostgreSQL. |
+| claude adapter never uses tools / replies "I don't have a tool for that" | `claude -p` blocks tool use without interactive confirmation. | Set `AGENT_HUB_CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS=1` in the adapter env and restart. See §2.9.5b. |
+| Hub launchd job (macOS) hangs at startup with no log output | TCC denies launchd access to `/Volumes/...`. Python startup blocks in `open()`. | Move the project off `/Volumes/` to a path on the boot volume, or grant Full Disk Access. See §2.9.5. |
 
 ---
 
