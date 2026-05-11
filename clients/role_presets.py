@@ -3,9 +3,13 @@
 One source of truth for role -> {capabilities, prompt, budget}. Skill helpers
 and adapters import from here so the table is never duplicated.
 
+Prompt text lives in `clients/role_prompts/*.md` (one file per role) so
+non-Python contributors can edit prompts without touching this module.
+`_common.md` is prepended to every non-None role prompt as a shared baseline.
+
 Design ref: design/phase2.3/design_v3.md §4 + §6.
 
-Stdlib only. No side effects at import time.
+Stdlib only. Prompts are read once at import time.
 """
 from __future__ import annotations
 
@@ -14,35 +18,49 @@ import pathlib
 from typing import Any
 
 
+_PROMPTS_DIR = pathlib.Path(__file__).parent / "role_prompts"
+
+
+def _load_prompt(role: str) -> str:
+    """Return `_common.md` + `<role>.md`, joined by a blank line.
+
+    Both files are required for any role with a prompt. Missing files raise
+    `FileNotFoundError` at import time so a broken install fails loudly.
+    """
+    common = (_PROMPTS_DIR / "_common.md").read_text(encoding="utf-8").strip()
+    role_text = (_PROMPTS_DIR / f"{role}.md").read_text(encoding="utf-8").strip()
+    return f"{common}\n\n{role_text}"
+
+
 BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
     "pm": {
         "capabilities": ["pm", "plan", "coordinate"],
-        "prompt": "You are the PM. Decompose, sequence, escalate.",
+        "prompt": _load_prompt("pm"),
         "budget": 30000,
     },
     "architect": {
         "capabilities": ["architect", "design"],
-        "prompt": "You are the architect. Module boundaries, data flow, tradeoffs.",
+        "prompt": _load_prompt("architect"),
         "budget": 50000,
     },
     "designer": {
         "capabilities": ["design", "spec"],
-        "prompt": "You are the designer. Concrete schemas, message shapes.",
+        "prompt": _load_prompt("designer"),
         "budget": 40000,
     },
     "coder": {
         "capabilities": ["code"],
-        "prompt": "You implement features. Match style. Test-first.",
+        "prompt": _load_prompt("coder"),
         "budget": 30000,
     },
     "reviewer": {
         "capabilities": ["review", "code-review"],
-        "prompt": "You critique. Find real bugs and design issues, ignore style nits.",
+        "prompt": _load_prompt("reviewer"),
         "budget": 20000,
     },
     "tester": {
         "capabilities": ["test"],
-        "prompt": "You write tests that fail without the change and pass with it.",
+        "prompt": _load_prompt("tester"),
         "budget": 20000,
     },
     "generic": {

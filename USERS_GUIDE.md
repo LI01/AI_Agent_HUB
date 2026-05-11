@@ -595,16 +595,20 @@ Even with the flag on, claude is more conservative than codex/opencode about rea
 
 ### 2.9.6 Roles + system prompts at a glance
 
-| Role | Capabilities | Default budget | System prompt |
-|------|--------------|----------------|---------------|
-| pm | pm, plan, coordinate | 30k | "You are the PM. Decompose, sequence, escalate." |
-| architect | architect, design | 50k | "You are the architect. Module boundaries, data flow, tradeoffs." |
-| designer | design, spec | 40k | "You are the designer. Concrete schemas, message shapes." |
-| coder | code | 30k | "You implement features. Match style. Test-first." |
-| reviewer | review, code-review | 20k | "You critique. Find real bugs and design issues, ignore style nits." |
-| tester | test | 20k | "You write tests that fail without the change and pass with it." |
-| generic | chat | 20k | (no preset) |
-| custom | (you supply) | (you supply or default 20k) | (you supply via `--system-prompt-extra`) |
+Built-in role prompts live in `clients/role_prompts/*.md` (one file per role). `_common.md` is prepended to every non-`None` role prompt as a shared baseline (no-hallucination, ask-don't-guess, cite file:line, match style, name tradeoffs, no padding). Edit a `.md` file to change a prompt — no Python touch needed.
+
+| Role | Capabilities | Default budget | Prompt focus | Source file |
+|------|--------------|----------------|--------------|-------------|
+| pm | pm, plan, coordinate | 30k | Decompose into smallest ordered steps; each step has input/artifact/check; escalate ambiguous decisions | `clients/role_prompts/pm.md` |
+| architect | architect, design | 50k | Pick module boundaries + state ownership + data-flow direction; name rejected alternatives | `clients/role_prompts/architect.md` |
+| designer | design, spec | 40k | Output typed schemas (not prose); per-field type/required/values + valid + invalid examples | `clients/role_prompts/designer.md` |
+| coder | code | 30k | Minimum surgical change; every line traces to the request; no adjacent refactors | `clients/role_prompts/coder.md` |
+| reviewer | review, code-review | 20k | Logic bugs > silent failures > concurrency > trust-boundary > contracts; file:line + scenario + fix | `clients/role_prompts/reviewer.md` |
+| tester | test | 20k | Failing-then-passing pair as proof; explicit boundary cases; one assertion of intent per test | `clients/role_prompts/tester.md` |
+| generic | chat | 20k | (no preset — CLI default applies) | — |
+| custom | (you supply) | (you supply or default 20k) | (you supply via `--system-prompt-extra`) | — |
+
+To override a built-in prompt without editing files, set `role_prompts.<role>` in `~/.agent-hub/config.json` (or `<cwd>/.agent-hub.local.json`). Overrides are the **complete** prompt — `_common.md` is not auto-prepended. If you want the shared baseline in your override, copy the contents of `_common.md` into it.
 
 Override via `~/.agent-hub/config.json` (see §2.9.1).
 

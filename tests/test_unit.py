@@ -536,66 +536,28 @@ def test_p22_unit_resolve_cap_version_picks_highest(hub_main):
 
 
 @pytest.mark.parametrize(
-    "role,expected_caps,expected_prompt,expected_budget",
+    "role,expected_caps,expected_budget",
     [
-        (
-            "pm",
-            ["pm", "plan", "coordinate"],
-            "You are the PM. Decompose, sequence, escalate.",
-            30000,
-        ),
-        (
-            "architect",
-            ["architect", "design"],
-            "You are the architect. Module boundaries, data flow, tradeoffs.",
-            50000,
-        ),
-        (
-            "designer",
-            ["design", "spec"],
-            "You are the designer. Concrete schemas, message shapes.",
-            40000,
-        ),
-        (
-            "coder",
-            ["code"],
-            "You implement features. Match style. Test-first.",
-            30000,
-        ),
-        (
-            "reviewer",
-            ["review", "code-review"],
-            "You critique. Find real bugs and design issues, ignore style nits.",
-            20000,
-        ),
-        (
-            "tester",
-            ["test"],
-            "You write tests that fail without the change and pass with it.",
-            20000,
-        ),
-        (
-            "generic",
-            ["chat"],
-            None,
-            20000,
-        ),
+        ("pm", ["pm", "plan", "coordinate"], 30000),
+        ("architect", ["architect", "design"], 50000),
+        ("designer", ["design", "spec"], 40000),
+        ("coder", ["code"], 30000),
+        ("reviewer", ["review", "code-review"], 20000),
+        ("tester", ["test"], 20000),
+        ("generic", ["chat"], 20000),
     ],
 )
-def test_p23_unit_role_preset_builtin_lookup(
-    role, expected_caps, expected_prompt, expected_budget
-):
+def test_p23_unit_role_preset_builtin_lookup(role, expected_caps, expected_budget):
     """get_preset(<role>) returns the spec capabilities, prompt, and budget
-    for every built-in role (design v3 §4)."""
-    from clients.role_presets import get_preset
+    for every built-in role (design v3 §4). Prompt content is asserted against
+    BUILTIN_PRESETS so prompt-text edits don't require test churn."""
+    from clients.role_presets import BUILTIN_PRESETS, get_preset
 
     p = get_preset(role)
     assert p["capabilities"] == expected_caps
-    if expected_prompt is None:
-        assert p["prompt"] is None
-    else:
-        assert p["prompt"] == expected_prompt
+    assert p["prompt"] == BUILTIN_PRESETS[role]["prompt"]
     assert p["budget"] == expected_budget
+    assert (p["prompt"] is None) == (role == "generic")
 
 
 def test_p23_unit_role_preset_unknown_raises():
@@ -630,7 +592,7 @@ def test_p23_unit_role_preset_user_overrides(tmp_path, monkeypatch):
         })
     )
 
-    from clients.role_presets import get_preset, load_user_overrides
+    from clients.role_presets import BUILTIN_PRESETS, get_preset, load_user_overrides
 
     role_prompts, role_budgets = load_user_overrides()
 
@@ -648,9 +610,7 @@ def test_p23_unit_role_preset_user_overrides(tmp_path, monkeypatch):
     tester = get_preset("tester", role_budgets=role_budgets, role_prompts=role_prompts)
     assert tester["budget"] == 88000
     # Tester prompt has no override -> built-in value.
-    assert tester["prompt"] == (
-        "You write tests that fail without the change and pass with it."
-    )
+    assert tester["prompt"] == BUILTIN_PRESETS["tester"]["prompt"]
 
     reviewer = get_preset(
         "reviewer", role_budgets=role_budgets, role_prompts=role_prompts
@@ -662,7 +622,7 @@ def test_p23_unit_role_preset_user_overrides(tmp_path, monkeypatch):
     # An unrelated role is entirely untouched.
     pm = get_preset("pm", role_budgets=role_budgets, role_prompts=role_prompts)
     assert pm["budget"] == 30000
-    assert pm["prompt"] == "You are the PM. Decompose, sequence, escalate."
+    assert pm["prompt"] == BUILTIN_PRESETS["pm"]["prompt"]
 
 
 def test_p23_unit_role_preset_malformed_config_no_raise(tmp_path, monkeypatch):
