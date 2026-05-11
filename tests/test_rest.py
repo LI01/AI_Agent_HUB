@@ -103,6 +103,60 @@ def test_i_tsk_6_priority_dispatch_order(client, agent_headers, submitter_key):
         assert high_task["started_at"] <= low_task["started_at"], "high priority must be assigned first"
 
 
+# === I-CFA: Cloudflare Access JWT alternate auth for view endpoints ===
+
+class _StubCfVerifier:
+    """Test double — returns claims for one specific token, None otherwise."""
+    def __init__(self, accept_token: str):
+        self.accept = accept_token
+
+    def verify(self, token):
+        if token == self.accept:
+            return {"email": "alice@example.com"}
+        return None
+
+
+def test_i_cfa_1_jwt_grants_view_when_verifier_accepts(client, hub_main):
+    hub_main.cf_access_verifier = _StubCfVerifier("good-jwt")
+    try:
+        r = client.get("/agents", headers={"Cf-Access-Jwt-Assertion": "good-jwt"})
+        assert r.status_code == 200
+        r = client.get("/tasks", headers={"Cf-Access-Jwt-Assertion": "good-jwt"})
+        assert r.status_code == 200
+    finally:
+        hub_main.cf_access_verifier = None
+
+
+def test_i_cfa_2_invalid_jwt_returns_403(client, hub_main):
+    hub_main.cf_access_verifier = _StubCfVerifier("good-jwt")
+    try:
+        r = client.get("/agents", headers={"Cf-Access-Jwt-Assertion": "wrong-token"})
+        assert r.status_code == 403
+    finally:
+        hub_main.cf_access_verifier = None
+
+
+def test_i_cfa_3_jwt_does_not_grant_mutating_endpoints(client, hub_main):
+    """JWT path is view-only; submit-task still needs a bearer with can_assign_tasks."""
+    hub_main.cf_access_verifier = _StubCfVerifier("good-jwt")
+    try:
+        r = client.post(
+            "/tasks",
+            headers={"Cf-Access-Jwt-Assertion": "good-jwt"},
+            json={"task": "echo"},
+        )
+        assert r.status_code == 403
+    finally:
+        hub_main.cf_access_verifier = None
+
+
+def test_i_cfa_4_jwt_path_disabled_when_verifier_is_none(client, hub_main):
+    """With no verifier configured, the JWT header is ignored — bearer still required."""
+    assert hub_main.cf_access_verifier is None
+    r = client.get("/agents", headers={"Cf-Access-Jwt-Assertion": "good-jwt"})
+    assert r.status_code == 403
+
+
 # === I-CAN: Task cancellation ===
 
 def test_i_can_1_cancel_queued_task_returns_200(client, agent_headers):

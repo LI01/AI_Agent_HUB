@@ -42,6 +42,7 @@ from .queue import TaskQueue
 from .registry import AgentRegistry
 from .router import Router
 from .mcp_protocol import InProcessHubBackend, handle_jsonrpc
+from . import cf_access as _cf_access_mod
 from pydantic import ValidationError
 
 
@@ -74,6 +75,11 @@ event_subscribers: list[asyncio.Queue] = []
 timeout_watcher_task: Optional[asyncio.Task] = None
 TERMINAL_STATUSES = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.TIMEOUT}
 
+# Optional alternate auth path for read endpoints: a verified Cloudflare
+# Access JWT in Cf-Access-Jwt-Assertion. Configured via AGENT_HUB_CF_ACCESS_*.
+# None when not configured -> JWT path is disabled entirely.
+cf_access_verifier = _cf_access_mod.from_env()
+
 # Wire delegation maps to the queue's lock so map mutations share the queue
 # lock (per design §2.4 — no new lock).
 delegation.set_lock(queue._lock)
@@ -101,18 +107,36 @@ def require_assign(authorization: Optional[str], target_agent: str = "") -> str:
     return auth_key
 
 
-def require_view_agents(authorization: Optional[str]) -> str:
-    auth_key = get_auth_key(authorization)
-    if not access_control.can_view_agents(auth_key):
-        raise HTTPException(status_code=403, detail="Agent view permission required")
-    return auth_key
+def _cf_access_authed(jwt_header: Optional[str]) -> bool:
+    """Return True if jwt_header is a valid CF Access JWT under the configured
+    verifier. Always False when the verifier isn't configured."""
+    if not jwt_header or cf_access_verifier is None:
+        return False
+    return cf_access_verifier.verify(jwt_header) is not None
 
 
-def require_view_tasks(authorization: Optional[str]) -> str:
+def require_view_agents(
+    authorization: Optional[str],
+    cf_access_jwt: Optional[str] = None,
+) -> str:
     auth_key = get_auth_key(authorization)
-    if not access_control.can_view_tasks(auth_key):
-        raise HTTPException(status_code=403, detail="Task view permission required")
-    return auth_key
+    if access_control.can_view_agents(auth_key):
+        return auth_key
+    if _cf_access_authed(cf_access_jwt):
+        return ""
+    raise HTTPException(status_code=403, detail="Agent view permission required")
+
+
+def require_view_tasks(
+    authorization: Optional[str],
+    cf_access_jwt: Optional[str] = None,
+) -> str:
+    auth_key = get_auth_key(authorization)
+    if access_control.can_view_tasks(auth_key):
+        return auth_key
+    if _cf_access_authed(cf_access_jwt):
+        return ""
+    raise HTTPException(status_code=403, detail="Task view permission required")
 
 
 def require_admin(authorization: Optional[str]) -> Permission:
@@ -1142,8 +1166,12 @@ async def submit_task(req: TaskSubmitRequest, authorization: Optional[str] = Hea
 
 
 @app.get("/tasks/{task_id}")
-def get_task(task_id: str, authorization: Optional[str] = Header(None)):
-    require_view_tasks(authorization)
+def get_task(
+    task_id: str,
+    authorization: Optional[str] = Header(None),
+    cf_access_jwt: Optional[str] = Header(None, alias="Cf-Access-Jwt-Assertion"),
+):
+    require_view_tasks(authorization, cf_access_jwt)
     task = queue.get(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -1184,8 +1212,9 @@ def list_tasks(
     parent_task_id: Optional[str] = None,
     top_level: bool = False,
     authorization: Optional[str] = Header(None),
+    cf_access_jwt: Optional[str] = Header(None, alias="Cf-Access-Jwt-Assertion"),
 ):
-    require_view_tasks(authorization)
+    require_view_tasks(authorization, cf_access_jwt)
     try:
         return queue.list_all(status, agent_id, parent_task_id=parent_task_id, top_level=top_level)
     except ValueError:
@@ -1196,21 +1225,31 @@ def list_tasks(
 
 
 @app.get("/agents")
-def list_agents(authorization: Optional[str] = Header(None)):
-    require_view_agents(authorization)
+def list_agents(
+    authorization: Optional[str] = Header(None),
+    cf_access_jwt: Optional[str] = Header(None, alias="Cf-Access-Jwt-Assertion"),
+):
+    require_view_agents(authorization, cf_access_jwt)
     return registry.list_all()
 
 
 @app.get("/capabilities")
-def list_capabilities(authorization: Optional[str] = Header(None)):
+def list_capabilities(
+    authorization: Optional[str] = Header(None),
+    cf_access_jwt: Optional[str] = Header(None, alias="Cf-Access-Jwt-Assertion"),
+):
     """Phase 2.2 Fix F6: top-level JSON array of aggregated capability rows."""
-    require_view_agents(authorization)
+    require_view_agents(authorization, cf_access_jwt)
     return aggregate_capabilities(registry.list_all())
 
 
 @app.get("/agents/{agent_id}")
-def get_agent(agent_id: str, authorization: Optional[str] = Header(None)):
-    require_view_agents(authorization)
+def get_agent(
+    agent_id: str,
+    authorization: Optional[str] = Header(None),
+    cf_access_jwt: Optional[str] = Header(None, alias="Cf-Access-Jwt-Assertion"),
+):
+    require_view_agents(authorization, cf_access_jwt)
     agent = registry.get(agent_id)
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -1218,8 +1257,12 @@ def get_agent(agent_id: str, authorization: Optional[str] = Header(None)):
 
 
 @app.get("/events")
-async def events(request: Request, authorization: Optional[str] = Header(None)):
-    require_view_tasks(authorization)
+async def events(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    cf_access_jwt: Optional[str] = Header(None, alias="Cf-Access-Jwt-Assertion"),
+):
+    require_view_tasks(authorization, cf_access_jwt)
     subscriber = asyncio.Queue()
     event_subscribers.append(subscriber)
 
@@ -1248,8 +1291,11 @@ def health():
 
 
 @app.get("/stats")
-def get_stats(authorization: Optional[str] = Header(None)):
-    require_view_tasks(authorization)
+def get_stats(
+    authorization: Optional[str] = Header(None),
+    cf_access_jwt: Optional[str] = Header(None, alias="Cf-Access-Jwt-Assertion"),
+):
+    require_view_tasks(authorization, cf_access_jwt)
     return db.get_stats()
 
 

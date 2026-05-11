@@ -181,6 +181,9 @@ Two macOS-specific gotchas:
 | `AGENT_HUB_TIMEOUT_POLICY` | `terminal` | `terminal` marks expired tasks `timeout`; `requeue` puts them back in the queue. |
 | `AGENT_HUB_TIMEOUT_SCAN_INTERVAL` | `5` | Seconds between timeout-watcher scans. |
 | `AGENT_HUB_CORS_ORIGINS` | `localhost,127.0.0.1` | Comma-separated allowed CORS origins. |
+| `AGENT_HUB_CF_ACCESS_TEAM_DOMAIN` | (unset) | Cloudflare Access team domain (e.g. `org.cloudflareaccess.com`). When set together with `_AUD`, enables an alternate **view-only** auth path: a verified `Cf-Access-Jwt-Assertion` header substitutes for a bearer token on `GET` endpoints. Mutating endpoints still require a bearer with the right permission. |
+| `AGENT_HUB_CF_ACCESS_AUD` | (unset) | Application audience tag from the Cloudflare Access app definition. Required to verify JWT `aud` claim. |
+| `AGENT_HUB_CF_ACCESS_ALLOWED_DOMAINS` | (empty = any) | Comma-separated email domains to permit via JWT (defense-in-depth on top of the Access policy). Example: `leopardimaging.com,aglaiasense.com`. |
 
 ## REST API
 
