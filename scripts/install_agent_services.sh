@@ -76,13 +76,23 @@ UNIT_DIR=$HOME/.config/systemd/user
 ENV_FILE=$UNIT_DIR/agent-hub.env
 mkdir -p "$UNIT_DIR" "$WORKDIRS"
 
-# Shared env file, mode 0600. The API key never enters argv.
+# Shared env file, mode 0600. The API key never enters argv. Update only
+# the two managed keys (AGENT_HUB_API_KEY, AGENT_HUB_URL) so any user-added
+# vars (e.g. AGENT_HUB_CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS) survive re-runs.
 umask 077
-cat > "$ENV_FILE" <<EOF
-AGENT_HUB_API_KEY=$AGENT_HUB_API_KEY
-AGENT_HUB_URL=$HUB
-EOF
+touch "$ENV_FILE"
 chmod 0600 "$ENV_FILE"
+update_env_kv() {
+    local key=$1 value=$2
+    if grep -q "^${key}=" "$ENV_FILE"; then
+        # `|` delimiter avoids escaping issues if value contains slashes.
+        sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
+    fi
+}
+update_env_kv AGENT_HUB_API_KEY "$AGENT_HUB_API_KEY"
+update_env_kv AGENT_HUB_URL "$HUB"
 
 COMMON_PATH=$EXTRA_PATH:/usr/local/bin:/usr/bin:/bin
 
