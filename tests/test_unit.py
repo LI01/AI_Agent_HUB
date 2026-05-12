@@ -2218,3 +2218,416 @@ def test_p24_unit_claude_materialize_then_readback(tmp_path, monkeypatch):
     # No misses, no truncation.
     assert "files_missing" not in result
     assert "files_truncated" not in result
+
+
+# === phase user-tokens / Slice A — task_usage / cost extract / task_submitters ===
+#
+# Design ref: Agent-comm/design/phase-user-tokens/design_v3.md §2.1-§2.3, §2.7,
+# §5 Slice A. All tests use `hub_main` fixture so each test gets a fresh DB +
+# fresh module import (DB is re-initialized by the import).
+
+
+def test_init_db_idempotent_owner_column(hub_main):
+    """A1: init_db is idempotent; api_keys.owner column appears exactly once after two calls."""
+    from hub import database as db
+    db.init_db()
+    db.init_db()  # second call must not raise
+    with db.get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(api_keys)")
+        cols = [row[1] for row in cursor.fetchall()]
+    assert cols.count("owner") == 1
+
+
+def test_save_api_key_persists_owner(hub_main):
+    """A2: owner kwarg is written into the api_keys row."""
+    from hub import database as db
+    db.save_api_key({
+        "key_hash": "h1",
+        "name": "k-with-owner",
+    }, owner="user@x.com")
+    with db.get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT owner FROM api_keys WHERE name = ?", ("k-with-owner",))
+        row = cursor.fetchone()
+    assert row is not None
+    assert row[0] == "user@x.com"
+
+
+def test_save_api_key_owner_default_null(hub_main):
+    """A3: omitting owner leaves the column NULL (back-compat for admin/agent keys)."""
+    from hub import database as db
+    db.save_api_key({
+        "key_hash": "h2",
+        "name": "k-no-owner",
+    })
+    with db.get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT owner FROM api_keys WHERE name = ?", ("k-no-owner",))
+        row = cursor.fetchone()
+    assert row is not None
+    assert row[0] is None
+
+
+def test_save_task_usage_and_list_roundtrip(hub_main):
+    """A4: insert two rows, list filters by owner, duplicate task_id is a no-op (INSERT OR IGNORE)."""
+    from hub import database as db
+    now = "2026-05-10T12:00:00"
+    db.save_task_usage({
+        "task_id": "t-a",
+        "owner_email": "a@x.com",
+        "agent_id": "claude-1",
+        "status": "completed",
+        "completed_at": now,
+        "cost_usd": 0.10,
+        "created_at": now,
+    })
+    db.save_task_usage({
+        "task_id": "t-b",
+        "owner_email": "b@x.com",
+        "agent_id": "claude-1",
+        "status": "completed",
+        "completed_at": now,
+        "cost_usd": 0.20,
+        "created_at": now,
+    })
+    # Duplicate task_id: should be ignored (idempotent re-finalize).
+    db.save_task_usage({
+        "task_id": "t-a",
+        "owner_email": "a@x.com",
+        "agent_id": "claude-1",
+        "status": "completed",
+        "completed_at": now,
+        "cost_usd": 99.99,  # different value — must NOT overwrite
+        "created_at": now,
+    })
+
+    a_rows = db.list_task_usage(owner="a@x.com")
+    assert len(a_rows) == 1
+    assert a_rows[0]["task_id"] == "t-a"
+    assert a_rows[0]["cost_usd"] == 0.10  # INSERT OR IGNORE preserved original
+
+    all_rows = db.list_task_usage()
+    assert {r["task_id"] for r in all_rows} == {"t-a", "t-b"}
+
+
+def test_list_task_usage_date_filter(hub_main):
+    """A5: from_dt/to_dt filter selects the right subset."""
+    from hub import database as db
+    rows = [
+        ("t-mon", "2026-05-04T12:00:00"),
+        ("t-wed", "2026-05-06T12:00:00"),
+        ("t-fri", "2026-05-08T12:00:00"),
+    ]
+    for tid, ts in rows:
+        db.save_task_usage({
+            "task_id": tid,
+            "owner_email": "z@x.com",
+            "status": "completed",
+            "completed_at": ts,
+            "created_at": ts,
+        })
+    mid = db.list_task_usage(
+        owner="z@x.com",
+        from_dt="2026-05-05T00:00:00",
+        to_dt="2026-05-07T00:00:00",
+    )
+    assert [r["task_id"] for r in mid] == ["t-wed"]
+
+
+def test_list_task_usage_top_level_only(hub_main):
+    """A6: top_level_only=True filters out rows with non-NULL parent_task_id."""
+    from hub import database as db
+    db.save_task_usage({
+        "task_id": "parent-1",
+        "parent_task_id": None,
+        "owner_email": "u@x.com",
+        "status": "completed",
+        "completed_at": "2026-05-10T01:00:00",
+        "created_at": "2026-05-10T01:00:00",
+    })
+    db.save_task_usage({
+        "task_id": "child-1",
+        "parent_task_id": "parent-1",
+        "owner_email": "u@x.com",
+        "status": "completed",
+        "completed_at": "2026-05-10T02:00:00",
+        "created_at": "2026-05-10T02:00:00",
+    })
+    top_only = db.list_task_usage(owner="u@x.com", top_level_only=True)
+    assert [r["task_id"] for r in top_only] == ["parent-1"]
+    both = db.list_task_usage(owner="u@x.com")
+    assert {r["task_id"] for r in both} == {"parent-1", "child-1"}
+
+
+def test_cost_extract_claude_real_shape(hub_main):
+    """A7: claude with `raw` wrapper — all four fields populated."""
+    from hub.cost_extract import cost_extract
+    fixture = {
+        "raw": {
+            "total_cost_usd": 0.0123,
+            "usage": {
+                "input_tokens": 4512,
+                "output_tokens": 821,
+                "server_tool_use": {"web_search_requests": 2},
+            },
+        },
+    }
+    out = cost_extract(fixture, "claude")
+    assert out == {
+        "cost_usd": 0.0123,
+        "input_tokens": 4512,
+        "output_tokens": 821,
+        "web_search_requests": 2,
+    }
+
+
+def test_cost_extract_claude_no_raw_wrapper(hub_main):
+    """A8: claude payload at top level (no `raw` wrapper) — fallback works."""
+    from hub.cost_extract import cost_extract
+    fixture = {
+        "total_cost_usd": 0.0123,
+        "usage": {
+            "input_tokens": 4512,
+            "output_tokens": 821,
+            "server_tool_use": {"web_search_requests": 2},
+        },
+    }
+    out = cost_extract(fixture, "claude")
+    assert out["cost_usd"] == 0.0123
+    assert out["input_tokens"] == 4512
+    assert out["output_tokens"] == 821
+    assert out["web_search_requests"] == 2
+
+
+def test_cost_extract_claude_missing_subkeys(hub_main):
+    """A9: missing optional subkeys yield None for those fields, no raise."""
+    from hub.cost_extract import cost_extract
+    fixture = {"raw": {"total_cost_usd": 0.5, "usage": {"input_tokens": 100}}}
+    out = cost_extract(fixture, "claude")
+    assert out["cost_usd"] == 0.5
+    assert out["input_tokens"] == 100
+    assert out["output_tokens"] is None
+    assert out["web_search_requests"] is None
+
+
+def test_cost_extract_opencode_reads_top_level_raw_events(hub_main):
+    """A10: opencode reads raw_events from top-level result, NOT from result['raw'] (v1 bug fix)."""
+    from hub.cost_extract import cost_extract
+    fixture = {
+        "raw_events": [
+            {"type": "step_finish", "cost": 0.01,
+             "part": {"tokens": {"input": 100, "output": 50}}},
+            {"type": "step_finish", "cost": 0.02,
+             "part": {"tokens": {"input": 200, "output": 80}}},
+        ],
+        "cli": "opencode",
+    }
+    out = cost_extract(fixture, "opencode")
+    assert out["cost_usd"] == pytest.approx(0.03)
+    assert out["input_tokens"] == 300
+    assert out["output_tokens"] == 130
+    assert out["web_search_requests"] is None
+
+
+def test_cost_extract_opencode_ignores_non_step_finish(hub_main):
+    """A11: events of types other than step_finish are skipped."""
+    from hub.cost_extract import cost_extract
+    fixture = {
+        "raw_events": [
+            {"type": "step_start", "cost": 99,
+             "part": {"tokens": {"input": 9999, "output": 9999}}},
+            {"type": "tool_call", "cost": 99,
+             "part": {"tokens": {"input": 9999, "output": 9999}}},
+            {"type": "step_finish", "cost": 0.05,
+             "part": {"tokens": {"input": 10, "output": 5}}},
+        ],
+    }
+    out = cost_extract(fixture, "opencode")
+    assert out["cost_usd"] == pytest.approx(0.05)
+    assert out["input_tokens"] == 10
+    assert out["output_tokens"] == 5
+
+
+def test_cost_extract_opencode_under_raw_wrapper_returns_none(hub_main):
+    """A12: raw_events wrapped under `raw` — opencode never wraps, so all-None."""
+    from hub.cost_extract import cost_extract
+    fixture = {"raw": {"raw_events": [
+        {"type": "step_finish", "cost": 0.01,
+         "part": {"tokens": {"input": 100, "output": 50}}},
+    ]}}
+    out = cost_extract(fixture, "opencode")
+    assert out == {
+        "cost_usd": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "web_search_requests": None,
+    }
+
+
+def test_cost_extract_codex_all_none(hub_main):
+    """A13: codex always returns all-None regardless of input."""
+    from hub.cost_extract import cost_extract
+    for inp in [
+        None,
+        {"total_cost_usd": 1.0, "usage": {"input_tokens": 100}},
+        {"raw_events": [{"type": "step_finish", "cost": 0.1}]},
+    ]:
+        out = cost_extract(inp, "codex")
+        assert out == {
+            "cost_usd": None,
+            "input_tokens": None,
+            "output_tokens": None,
+            "web_search_requests": None,
+        }
+
+
+def test_cost_extract_malformed_returns_nones(hub_main):
+    """A14: malformed inputs never raise — return all-None."""
+    from hub.cost_extract import cost_extract
+    for inp, cli in [
+        (None, "claude"),
+        ("not-json", "claude"),
+        (12345, "claude"),
+        ({"random": "shape"}, "claude"),
+        (None, "opencode"),
+        ("not-json", "opencode"),
+        ({"random": "shape"}, "opencode"),
+        ({}, None),
+    ]:
+        out = cost_extract(inp, cli)
+        assert out == {
+            "cost_usd": None,
+            "input_tokens": None,
+            "output_tokens": None,
+            "web_search_requests": None,
+        }
+
+
+def test_cost_extract_string_input_is_parsed(hub_main):
+    """A15: JSON-stringified claude payload yields same as dict input."""
+    from hub.cost_extract import cost_extract
+    payload = {
+        "raw": {
+            "total_cost_usd": 0.0123,
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+        },
+    }
+    dict_out = cost_extract(payload, "claude")
+    str_out = cost_extract(json.dumps(payload), "claude")
+    assert dict_out == str_out
+    assert str_out["cost_usd"] == 0.0123
+
+
+def test_cost_extract_claude_empty_raw_falls_back_to_top_level(hub_main):
+    """Regression (v2 fix #1): empty `raw` dict must fall back to top-level
+    Claude payload, not yield all-None."""
+    from hub.cost_extract import cost_extract
+    fixture = {
+        "raw": {},
+        "total_cost_usd": 0.0123,
+        "usage": {
+            "input_tokens": 4512,
+            "output_tokens": 821,
+            "server_tool_use": {"web_search_requests": 2},
+        },
+    }
+    out = cost_extract(fixture, "claude")
+    assert out == {
+        "cost_usd": 0.0123,
+        "input_tokens": 4512,
+        "output_tokens": 821,
+        "web_search_requests": 2,
+    }
+
+
+def test_cost_extract_opencode_partial_tokens_only_input(hub_main):
+    """Regression (v2 fix #2): a step_finish event with only `tokens.input`
+    must yield input_tokens populated and output_tokens=None (not 0)."""
+    from hub.cost_extract import cost_extract
+    fixture = {
+        "raw_events": [
+            {"type": "step_finish", "cost": 0.01,
+             "part": {"tokens": {"input": 100}}},
+        ],
+    }
+    out = cost_extract(fixture, "opencode")
+    assert out["cost_usd"] == pytest.approx(0.01)
+    assert out["input_tokens"] == 100
+    assert out["output_tokens"] is None
+    assert out["web_search_requests"] is None
+
+
+def test_cli_from_agent_id(hub_main):
+    """A16: agent_id prefix maps to CLI label."""
+    from hub.cost_extract import cli_from_agent_id
+    assert cli_from_agent_id("claude-laptop-01") == "claude"
+    assert cli_from_agent_id("opencode-x") == "opencode"
+    assert cli_from_agent_id("codex-y") == "codex"
+    assert cli_from_agent_id("random-thing") is None
+    assert cli_from_agent_id(None) is None
+    assert cli_from_agent_id("") is None
+
+
+def test_record_and_peek_submitter(hub_main):
+    """A17: peek is non-destructive."""
+    from hub import database as db
+    db.record_submitter("t1", "key-a", "u@x.com")
+    first = db.peek_submitter("t1")
+    second = db.peek_submitter("t1")
+    assert first == {"api_key_name": "key-a", "owner_email": "u@x.com"}
+    assert second == first
+
+
+def test_pop_submitter_deletes(hub_main):
+    """A18: pop returns the row then deletes it; second pop returns None."""
+    from hub import database as db
+    db.record_submitter("t2", "k", "e@x.com")
+    first = db.pop_submitter("t2")
+    assert first == {"api_key_name": "k", "owner_email": "e@x.com"}
+    second = db.pop_submitter("t2")
+    assert second is None
+
+
+def test_record_submitter_overwrites(hub_main):
+    """A19: INSERT OR REPLACE semantics — second record wins."""
+    from hub import database as db
+    db.record_submitter("t3", "k1", "e1@x.com")
+    db.record_submitter("t3", "k2", "e2@x.com")
+    assert db.peek_submitter("t3") == {"api_key_name": "k2", "owner_email": "e2@x.com"}
+
+
+def test_pop_submitter_missing_returns_none(hub_main):
+    """A20: pop on missing row is a no-op (returns None, doesn't raise)."""
+    from hub import database as db
+    assert db.pop_submitter("does-not-exist") is None
+
+
+def test_by_day_python_bucket_correct(hub_main):
+    """A21: Python `completed_at[:10]` bucketing — guards against v1 SQLite substr(0,10) bug.
+
+    SQLite `substr(completed_at, 0, 10)` is 1-indexed and returns 9 chars
+    (broken). The correct day bucket uses Python `completed_at[:10]`.
+    """
+    rows = [
+        {"completed_at": "2026-05-10T01:02:03.456", "cost_usd": 0.1},
+        {"completed_at": "2026-05-10T23:59:59.000", "cost_usd": 0.2},
+        {"completed_at": "2026-05-11T00:00:00.000", "cost_usd": 0.3},
+    ]
+    by_day: dict = {}
+    for row in rows:
+        completed = row.get("completed_at")
+        day = completed[:10] if isinstance(completed, str) and len(completed) >= 10 else None
+        if day is not None:
+            entry = by_day.setdefault(day, {"cost_usd": 0.0, "row_count": 0})
+            entry["cost_usd"] += row.get("cost_usd") or 0.0
+            entry["row_count"] += 1
+
+    assert set(by_day.keys()) == {"2026-05-10", "2026-05-11"}
+    assert by_day["2026-05-10"]["row_count"] == 2
+    assert by_day["2026-05-11"]["row_count"] == 1
+    assert by_day["2026-05-10"]["cost_usd"] == pytest.approx(0.3)
+    assert by_day["2026-05-11"]["cost_usd"] == pytest.approx(0.3)
+    # Regression assertion: each bucketed key is EXACTLY 10 chars (not 9).
+    for k in by_day:
+        assert len(k) == 10

@@ -882,3 +882,464 @@ def test_i_ui_3_missing_asset_404(client):
     """GET /ui/some-missing-asset returns 404 (StaticFiles default)."""
     r = client.get("/ui/does-not-exist.css")
     assert r.status_code == 404
+
+
+# === I-MEK / I-MEU / I-USG: phase user-tokens (design v3 §5 Slice B) =========
+
+
+class _StubCfMultiVerifier:
+    """Test double — maps multiple tokens to claim sets, None otherwise."""
+
+    def __init__(self, mapping: dict):
+        # mapping: {token: claims_dict}
+        self.mapping = mapping
+
+    def verify(self, token):
+        return self.mapping.get(token)
+
+
+def _jwt_headers_for(email: str, token: str = None) -> dict:
+    token = token or f"jwt-for-{email}"
+    return {"Cf-Access-Jwt-Assertion": token}
+
+
+def _install_cf_verifier(hub_main, *emails) -> dict:
+    """Install a CF verifier accepting one token per email; return a map of
+    `email -> token` for convenience."""
+    mapping = {}
+    for email in emails:
+        mapping[f"jwt-for-{email}"] = {"email": email}
+    hub_main.cf_access_verifier = _StubCfMultiVerifier(mapping)
+    return mapping
+
+
+# ---------- /me/keys ----------
+
+
+def test_me_keys_post_creates_key_owned_by_jwt_email(client, hub_main):
+    _install_cf_verifier(hub_main, "alice@example.com")
+    try:
+        r = client.post(
+            "/me/keys",
+            headers=_jwt_headers_for("alice@example.com"),
+            json={"name": "alice-laptop"},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["api_key"]
+        assert body["owner"] == "alice@example.com"
+        assert body["permission"]["can_assign_tasks"] is True
+        assert body["permission"]["is_admin"] is False
+        assert body["permission"]["can_register"] is False
+        assert body["expires_at"]
+        # DB row carries owner.
+        from hub import database as db
+        rows = [r for r in db.list_api_keys() if r["name"] == "alice-laptop"]
+        assert rows and rows[0]["owner"] == "alice@example.com"
+    finally:
+        hub_main.cf_access_verifier = None
+
+
+def test_me_keys_post_without_jwt_returns_403(client, hub_main):
+    # No verifier installed → 403 (no JWT path).
+    r = client.post("/me/keys", json={"name": "x"})
+    assert r.status_code == 403
+
+
+def test_me_keys_get_lists_only_user_own_keys(client, hub_main):
+    _install_cf_verifier(hub_main, "alice@example.com", "bob@example.com")
+    try:
+        client.post(
+            "/me/keys",
+            headers=_jwt_headers_for("alice@example.com"),
+            json={"name": "alice-k1"},
+        )
+        client.post(
+            "/me/keys",
+            headers=_jwt_headers_for("alice@example.com"),
+            json={"name": "alice-k2"},
+        )
+        client.post(
+            "/me/keys",
+            headers=_jwt_headers_for("bob@example.com"),
+            json={"name": "bob-k1"},
+        )
+        ra = client.get("/me/keys", headers=_jwt_headers_for("alice@example.com"))
+        assert ra.status_code == 200
+        names_a = sorted(k["name"] for k in ra.json())
+        assert names_a == ["alice-k1", "alice-k2"]
+        # Seed-admin (NULL owner) must not appear.
+        assert "seed-admin" not in names_a
+        rb = client.get("/me/keys", headers=_jwt_headers_for("bob@example.com"))
+        names_b = [k["name"] for k in rb.json()]
+        assert names_b == ["bob-k1"]
+    finally:
+        hub_main.cf_access_verifier = None
+
+
+def test_me_keys_delete_only_user_own(client, hub_main):
+    _install_cf_verifier(hub_main, "alice@example.com", "bob@example.com")
+    try:
+        client.post(
+            "/me/keys",
+            headers=_jwt_headers_for("alice@example.com"),
+            json={"name": "alice-k"},
+        )
+        # Bob tries to revoke alice's key → 404 (not 403, no leakage).
+        rb = client.delete(
+            "/me/keys/alice-k", headers=_jwt_headers_for("bob@example.com")
+        )
+        assert rb.status_code == 404
+        # Alice revokes her own → 200.
+        ra = client.delete(
+            "/me/keys/alice-k", headers=_jwt_headers_for("alice@example.com")
+        )
+        assert ra.status_code == 200
+    finally:
+        hub_main.cf_access_verifier = None
+
+
+def test_me_keys_post_duplicate_name_returns_409(client, hub_main):
+    _install_cf_verifier(hub_main, "alice@example.com")
+    try:
+        h = _jwt_headers_for("alice@example.com")
+        r1 = client.post("/me/keys", headers=h, json={"name": "dup"})
+        assert r1.status_code == 200
+        r2 = client.post("/me/keys", headers=h, json={"name": "dup"})
+        assert r2.status_code == 409
+    finally:
+        hub_main.cf_access_verifier = None
+
+
+def test_me_keys_post_soft_cap_returns_429_on_11th(client, hub_main):
+    _install_cf_verifier(hub_main, "alice@example.com")
+    try:
+        h = _jwt_headers_for("alice@example.com")
+        for i in range(10):
+            r = client.post("/me/keys", headers=h, json={"name": f"k{i}"})
+            assert r.status_code == 200, r.text
+        # 11th must be 429.
+        r = client.post("/me/keys", headers=h, json={"name": "k10"})
+        assert r.status_code == 429
+        assert "Max 10" in r.json()["detail"]
+    finally:
+        hub_main.cf_access_verifier = None
+
+
+# ---------- /me/usage ----------
+
+
+def _seed_usage_row(
+    task_id: str,
+    owner_email: str,
+    *,
+    agent_id: str = "claude-a1",
+    cli: str = "claude",
+    parent_task_id=None,
+    cost_usd=0.01,
+    completed_at: str = None,
+):
+    from hub import database as db
+    now = completed_at or datetime_now_iso()
+    db.save_task_usage({
+        "task_id": task_id,
+        "parent_task_id": parent_task_id,
+        "api_key_name": f"{owner_email}-key",
+        "owner_email": owner_email,
+        "agent_id": agent_id,
+        "cli": cli,
+        "task_type": "general",
+        "status": "completed",
+        "started_at": now,
+        "completed_at": now,
+        "duration_seconds": 1.0,
+        "cost_usd": cost_usd,
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "web_search_requests": None,
+        "created_at": now,
+    })
+
+
+def datetime_now_iso():
+    from datetime import datetime
+    return datetime.now().isoformat()
+
+
+def test_me_usage_lists_only_user_own_rows(client, hub_main):
+    _install_cf_verifier(hub_main, "alice@example.com", "bob@example.com")
+    try:
+        _seed_usage_row("t-a-1", "alice@example.com", cost_usd=0.05)
+        _seed_usage_row("t-a-2", "alice@example.com", cost_usd=0.10)
+        _seed_usage_row("t-b-1", "bob@example.com", cost_usd=0.20)
+        r = client.get("/me/usage", headers=_jwt_headers_for("alice@example.com"))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        ids = sorted(row["task_id"] for row in body["rows"])
+        assert ids == ["t-a-1", "t-a-2"]
+        assert abs(body["total_cost_usd"] - 0.15) < 1e-9
+        assert body["total_count"] == 2
+    finally:
+        hub_main.cf_access_verifier = None
+
+
+def test_me_usage_top_level_only_filter_excludes_children(client, hub_main):
+    """B13: ?top_level_only=true excludes delegated rows."""
+    _install_cf_verifier(hub_main, "alice@example.com")
+    try:
+        _seed_usage_row("t-top", "alice@example.com", parent_task_id=None, cost_usd=0.5)
+        _seed_usage_row(
+            "t-child", "alice@example.com",
+            parent_task_id="t-top", cost_usd=0.1,
+        )
+        r_all = client.get(
+            "/me/usage", headers=_jwt_headers_for("alice@example.com")
+        )
+        assert r_all.status_code == 200
+        assert r_all.json()["total_count"] == 2
+        r_top = client.get(
+            "/me/usage?top_level_only=true",
+            headers=_jwt_headers_for("alice@example.com"),
+        )
+        body = r_top.json()
+        assert body["total_count"] == 1
+        assert body["rows"][0]["task_id"] == "t-top"
+        # Aggregates: split confirms top-level vs delegated counts.
+        assert body["top_level_row_count"] == 1
+        assert body["delegated_row_count"] == 0
+    finally:
+        hub_main.cf_access_verifier = None
+
+
+# ---------- /admin/usage ----------
+
+
+def test_admin_usage_requires_admin(client, admin_headers, viewer_key):
+    r1 = client.get(
+        "/admin/usage", headers={"Authorization": f"Bearer {viewer_key}"}
+    )
+    assert r1.status_code == 403
+    r2 = client.get("/admin/usage", headers=admin_headers)
+    assert r2.status_code == 200
+
+
+def test_admin_usage_filters_by_email(client, admin_headers):
+    _seed_usage_row("t-a-1", "alice@example.com", cost_usd=0.05)
+    _seed_usage_row("t-b-1", "bob@example.com", cost_usd=0.20)
+    r = client.get(
+        "/admin/usage?email=alice@example.com", headers=admin_headers
+    )
+    assert r.status_code == 200
+    body = r.json()
+    ids = sorted(row["task_id"] for row in body["rows"])
+    assert ids == ["t-a-1"]
+
+
+# ---------- finalize_task usage write + submitter attribution ----------
+
+
+def test_submit_task_records_submitter(client, hub_main, submitter_key):
+    """B22: submit_task immediately persists (api_key_name, owner_email) for
+    the submitter's bearer key into task_submitters — restart-safe."""
+    sub_h = {"Authorization": f"Bearer {submitter_key}"}
+    r = client.post("/tasks", headers=sub_h, json={"task": "x", "task_type": "echo"})
+    tid = r.json()["task_id"]
+    from hub import database as db
+    row = db.peek_submitter(tid)
+    assert row is not None
+    assert row["api_key_name"] == "submitter-key"  # owner is NULL for admin-minted
+
+
+def test_finalize_task_writes_usage_row(
+    client, hub_main, agent_headers, submitter_key
+):
+    """finalize_task → row in task_usage with cost extracted from claude result."""
+    import asyncio
+    from hub.models import TaskStatus
+    sub_h = {"Authorization": f"Bearer {submitter_key}"}
+    client.post(
+        "/register", headers=agent_headers,
+        json={"agent_id": "claude-a1", "capabilities": ["echo"]},
+    )
+    r = client.post(
+        "/tasks", headers=sub_h,
+        json={"task": "x", "task_type": "echo", "target_agent": "claude-a1"},
+    )
+    tid = r.json()["task_id"]
+    # Finalize with a claude-shaped result.
+    result = {
+        "raw": {
+            "total_cost_usd": 0.0123,
+            "usage": {
+                "input_tokens": 4512,
+                "output_tokens": 821,
+                "server_tool_use": {"web_search_requests": 2},
+            },
+        }
+    }
+    asyncio.run(
+        hub_main.finalize_task(tid, TaskStatus.COMPLETED, result=result)
+    )
+    from hub import database as db
+    rows = db.list_task_usage(limit=1000)
+    matching = [row for row in rows if row["task_id"] == tid]
+    assert len(matching) == 1, f"expected one task_usage row for {tid}"
+    row = matching[0]
+    assert row["status"] == "completed"
+    assert row["cli"] == "claude"
+    assert abs((row["cost_usd"] or 0) - 0.0123) < 1e-9
+    assert row["input_tokens"] == 4512
+    assert row["output_tokens"] == 821
+    assert row["web_search_requests"] == 2
+    assert row["api_key_name"] == "submitter-key"
+    assert row["parent_task_id"] is None
+
+
+def test_finalize_task_propagates_root_submitter_to_child(
+    client, hub_main, agent_headers, submitter_key
+):
+    """B20: child task inherits root submitter via peek_submitter copy. Verified
+    by examining the child's task_submitters row after a synthesized
+    submit_child propagation step."""
+    sub_h = {"Authorization": f"Bearer {submitter_key}"}
+    # Top-level task submitted by submitter.
+    r = client.post("/tasks", headers=sub_h, json={"task": "x", "task_type": "echo"})
+    parent_tid = r.json()["task_id"]
+    # Simulate the submit_child propagation step directly: it's the same
+    # peek + record that the WS handler runs.
+    from hub import database as db
+    child_id = "child-of-" + parent_tid
+    parent_row = db.peek_submitter(parent_tid) or {}
+    db.record_submitter(
+        child_id,
+        parent_row.get("api_key_name"),
+        parent_row.get("owner_email"),
+    )
+    inherited = db.peek_submitter(child_id)
+    assert inherited["api_key_name"] == "submitter-key"
+
+
+def test_three_level_chain_inherits_root_submitter(client, hub_main, submitter_key):
+    """B21: top → child → grandchild — all carry root submitter via one-hop
+    propagation."""
+    sub_h = {"Authorization": f"Bearer {submitter_key}"}
+    r = client.post("/tasks", headers=sub_h, json={"task": "root", "task_type": "echo"})
+    root_tid = r.json()["task_id"]
+    from hub import database as db
+    child_id = "child-" + root_tid
+    grand_id = "grand-" + root_tid
+    # Step 1: child inherits from root.
+    parent_row = db.peek_submitter(root_tid) or {}
+    db.record_submitter(
+        child_id, parent_row.get("api_key_name"), parent_row.get("owner_email")
+    )
+    # Step 2: grandchild inherits from child (which inherited from root).
+    child_row = db.peek_submitter(child_id) or {}
+    db.record_submitter(
+        grand_id, child_row.get("api_key_name"), child_row.get("owner_email")
+    )
+    assert db.peek_submitter(grand_id)["api_key_name"] == "submitter-key"
+
+
+def test_rejected_child_submit_leaves_no_submitter_row(
+    client, hub_main, agent_headers, submitter_key
+):
+    """B24 (v3 Finding 2): when a child submission is rejected, the
+    `_rollback_child()` helper must drop the task_submitters row it inserted
+    so attribution state doesn't leak.
+
+    Empty capabilities are wildcard in this codebase, so the parent must
+    advertise a different concrete capability to force capability_unavailable.
+    """
+    import asyncio, uuid
+    from hub.models import MachineInfo, AgentStatus
+    from hub import database as db
+
+    sub_h = {"Authorization": f"Bearer {submitter_key}"}
+
+    # Register parent with a concrete capability. A child asking for any other
+    # task_type is rejected by the self-target capability gate.
+    hub_main.registry.register(
+        "parent-agent", ["echo"], MachineInfo(), status=AgentStatus.IDLE
+    )
+    hub_main.save_agent(hub_main.registry.get("parent-agent"))
+
+    r = client.post(
+        "/tasks",
+        headers=sub_h,
+        json={"task": "p", "task_type": "echo", "target_agent": "parent-agent"},
+    )
+    assert r.status_code == 200, r.text
+    parent_tid = r.json()["task_id"]
+
+    parent_task = hub_main.queue.get(parent_tid)
+    if parent_task.assigned_agent_id is None:
+        assert hub_main.queue.assign(parent_tid, "parent-agent")
+        hub_main.save_task(hub_main.queue.get(parent_tid))
+    assert hub_main.queue.get(parent_tid).assigned_agent_id == "parent-agent"
+    assert db.peek_submitter(parent_tid) is not None
+
+    class _DummyWS:
+        pass
+
+    ws = _DummyWS()
+    hub_main.manager.active_connections["parent-agent"] = ws
+    hub_main.manager.ws_to_agent[ws] = "parent-agent"
+    hub_main.manager.session_keys[ws] = submitter_key
+
+    sent: list = []
+    emitted: list = []
+    orig_send = hub_main.manager.send
+    orig_emit_event = hub_main.emit_event
+
+    async def spy_send(agent_id, message):
+        sent.append((agent_id, message))
+        return True
+
+    def spy_emit_event(event_type, data):
+        emitted.append((event_type, data))
+        return orig_emit_event(event_type, data)
+
+    hub_main.manager.send = spy_send
+    hub_main.emit_event = spy_emit_event
+    try:
+        request_id = str(uuid.uuid4())
+        msg = {
+            "type": "submit_child",
+            "request_id": request_id,
+            "parent_task_id": parent_tid,
+            "target_agent": "parent-agent",
+            "task": "c",
+            "task_type": "unsupported-cap",
+            "min_version": 1,
+        }
+        asyncio.run(hub_main._handle_submit_child("parent-agent", msg))
+    finally:
+        hub_main.manager.send = orig_send
+        hub_main.emit_event = orig_emit_event
+        hub_main.manager.active_connections.pop("parent-agent", None)
+        hub_main.manager.ws_to_agent.pop(ws, None)
+        hub_main.manager.session_keys.pop(ws, None)
+
+    rejections = [m for (_, m) in sent if m.get("type") == "child_rejected"]
+    assert rejections, f"expected child_rejected message, got: {sent}"
+    assert rejections[0]["reason"] == "capability_unavailable"
+
+    created = [
+        data
+        for event_type, data in emitted
+        if event_type == "task_created" and data.get("parent_task_id") == parent_tid
+    ]
+    assert len(created) == 1, f"expected one rejected child creation event, got: {emitted}"
+    child_id = created[0]["task_id"]
+
+    assert db.peek_submitter(child_id) is None
+    with db.get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM task_submitters WHERE task_id = ?", (child_id,))
+        assert cur.fetchone()[0] == 0
+        cur.execute("SELECT COUNT(*) FROM tasks WHERE id = ?", (child_id,))
+        assert cur.fetchone()[0] == 0
+
+    # The parent's own submitter row is still present.
+    assert db.peek_submitter(parent_tid) is not None

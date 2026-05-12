@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 from typing import Dict, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -147,6 +147,23 @@ def require_admin(authorization: Optional[str]) -> Permission:
     if not perm or not perm.is_admin:
         raise HTTPException(status_code=403, detail="Admin access required")
     return perm
+
+
+def require_jwt_email(cf_access_jwt: Optional[str]) -> str:
+    """Verify the CF Access JWT and return the lowercased email.
+
+    Raises 403 if the JWT is absent, the verifier isn't configured, the JWT
+    is invalid, or the claims lack an email. Per design v3 §3.
+    """
+    if not cf_access_jwt or cf_access_verifier is None:
+        raise HTTPException(status_code=403, detail="CF Access JWT required")
+    claims = cf_access_verifier.verify(cf_access_jwt)
+    if not claims:
+        raise HTTPException(status_code=403, detail="CF Access JWT invalid")
+    email = (claims.get("email") or "").lower().strip()
+    if not email:
+        raise HTTPException(status_code=403, detail="JWT missing email")
+    return email
 
 
 def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -558,6 +575,53 @@ async def _notify_parent_of_child(child_task: Task) -> None:
     )
 
 
+def _write_task_usage(task: Task) -> None:
+    """Insert a task_usage row for a finalized task. Per design §2.8 / §3.6.
+
+    Pops the submitter row (so it's idempotent on re-finalize), extracts
+    cost/tokens via cost_extract, and INSERT OR IGNOREs into task_usage.
+    Raises only when the underlying DB layer raises — the caller wraps in
+    try/except so the task is never failed by a usage-write error.
+    """
+    from . import cost_extract as _cost_extract  # local import: keeps top simple
+
+    cli = _cost_extract.cli_from_agent_id(task.assigned_agent_id)
+    cost = _cost_extract.cost_extract(task.result, cli)
+    submitter = db.pop_submitter(task.task_id) or {}
+    api_key_name = submitter.get("api_key_name")
+    owner_email = submitter.get("owner_email")
+
+    started_iso = task.started_at.isoformat() if task.started_at else None
+    completed_dt = task.completed_at or datetime.now()
+    completed_iso = completed_dt.isoformat()
+    duration = None
+    if task.started_at and task.completed_at:
+        duration = (task.completed_at - task.started_at).total_seconds()
+
+    status_val = (
+        task.status.value if hasattr(task.status, "value") else str(task.status)
+    )
+    row = {
+        "task_id": task.task_id,
+        "parent_task_id": task.parent_task_id,
+        "api_key_name": api_key_name,
+        "owner_email": owner_email,
+        "agent_id": task.assigned_agent_id,
+        "cli": cli,
+        "task_type": task.task_type,
+        "status": status_val,
+        "started_at": started_iso,
+        "completed_at": completed_iso,
+        "duration_seconds": duration,
+        "cost_usd": cost.get("cost_usd"),
+        "input_tokens": cost.get("input_tokens"),
+        "output_tokens": cost.get("output_tokens"),
+        "web_search_requests": cost.get("web_search_requests"),
+        "created_at": datetime.now().isoformat(),
+    }
+    db.save_task_usage(row)
+
+
 async def finalize_task(
     task_id: str,
     status: TaskStatus,
@@ -600,6 +664,14 @@ async def finalize_task(
         emit_event(
             "task_updated",
             task_event_data(task_id, status=status_value, result=refreshed.result),
+        )
+
+    # task_usage write — never fails the task on error (design §3.6).
+    try:
+        _write_task_usage(refreshed)
+    except Exception as exc:
+        db.log_activity(
+            "task", task_id, "task_usage_write_failed", {"error": str(exc)}
         )
 
     # Multi-task idle accounting (design §2.6).
@@ -998,6 +1070,23 @@ async def _handle_submit_child(parent_agent_id: str, msg: dict):
         "delegated_by_agent",
         {"parent_task_id": parent_task_id, "parent_agent_id": parent_agent_id},
     )
+
+    # Propagate root submitter from parent → child (design §3.8).
+    # peek_submitter is non-destructive; if the parent has no row (anonymous
+    # / pre-phase), we still record (child_id, None, None) so the row
+    # invariant for live child tasks holds.
+    try:
+        parent_row = db.peek_submitter(parent_task_id) or {}
+        db.record_submitter(
+            child_id,
+            parent_row.get("api_key_name"),
+            parent_row.get("owner_email"),
+        )
+    except Exception as exc:
+        db.log_activity(
+            "task", child_id, "record_submitter_failed", {"error": str(exc)}
+        )
+
     emit_event(
         "task_created",
         task_event_data(
@@ -1018,6 +1107,14 @@ async def _handle_submit_child(parent_agent_id: str, msg: dict):
             with db.get_db() as conn:
                 conn.cursor().execute("DELETE FROM tasks WHERE id = ?", (child_id,))
                 conn.commit()
+        except Exception:
+            pass
+        # v3 Finding 2: drop the task_submitters row inserted above so a
+        # rejected child doesn't leak attribution state. pop_submitter is a
+        # no-op when the row is already absent, so it's safe to call
+        # unconditionally across every rejection branch.
+        try:
+            db.pop_submitter(child_id)
         except Exception:
             pass
 
@@ -1159,6 +1256,28 @@ async def submit_task(req: TaskSubmitRequest, authorization: Optional[str] = Hea
         parent_task_id=req.parent_task_id,
     )
     save_task(task)
+
+    # Record submitter attribution (design §3.7). Resolve the bearer key →
+    # (name, owner) via the same hash lookup auth.validate_key uses; tolerate
+    # missing/anon bearers by recording (None, None).
+    raw_bearer = get_auth_key(authorization) or ""
+    submitter_name: Optional[str] = None
+    submitter_owner: Optional[str] = None
+    if raw_bearer:
+        try:
+            key_row = db.get_api_key_by_hash(access_control.hash_key(raw_bearer))
+        except Exception:
+            key_row = None
+        if key_row:
+            submitter_name = key_row.get("name")
+            submitter_owner = key_row.get("owner")
+    try:
+        db.record_submitter(task_id, submitter_name, submitter_owner)
+    except Exception as exc:
+        db.log_activity(
+            "task", task_id, "record_submitter_failed", {"error": str(exc)}
+        )
+
     db.log_activity("task", task_id, "created", {"task_type": task_type})
     emit_event("task_created", task_event_data(task_id, task_type=task_type))
 
@@ -1372,6 +1491,308 @@ def revoke_api_key(key_name: str, authorization: Optional[str] = Header(None)):
     if access_control.revoke_key(key_name):
         return {"status": "revoked", "name": key_name}
     raise HTTPException(status_code=404, detail="Key not found")
+
+
+# ============================================================================
+# Phase user-tokens — /me/* and /admin/usage endpoints (design v3 §3)
+# ============================================================================
+
+import re as _re_user_tokens
+from datetime import timedelta as _td_user_tokens
+
+_USER_KEY_NAME_RE = _re_user_tokens.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_USER_KEY_MAX_ACTIVE = 10
+_USER_KEY_TTL_DAYS = 90
+
+
+class CreateUserKeyRequest(BaseModel):
+    name: str
+
+
+def _user_key_permission() -> Permission:
+    """Fixed non-admin scope for user-minted keys (design §3.1)."""
+    return Permission(
+        can_register=False,
+        can_assign_tasks=True,
+        can_view_agents=True,
+        can_view_tasks=True,
+        allowed_agents=[],
+        is_admin=False,
+    )
+
+
+def _key_active(row: dict) -> bool:
+    """True iff the api_keys row is currently active and not past expiry."""
+    if not row.get("active"):
+        return False
+    expires_at = row.get("expires_at")
+    if expires_at:
+        try:
+            if datetime.fromisoformat(expires_at) < datetime.now():
+                return False
+        except (TypeError, ValueError):
+            pass
+    return True
+
+
+def _list_keys_for_owner(email: str) -> list[dict]:
+    return [row for row in db.list_api_keys() if (row.get("owner") or "") == email]
+
+
+def _key_row_to_public(row: dict) -> dict:
+    """Public shape: no raw key, no key_hash."""
+    return {
+        "name": row["name"],
+        "owner": row.get("owner"),
+        "permission": {
+            "can_register": bool(row.get("can_register")),
+            "can_assign_tasks": bool(row.get("can_assign_tasks")),
+            "can_view_agents": bool(row.get("can_view_agents")),
+            "can_view_tasks": bool(row.get("can_view_tasks")),
+            "allowed_agents": json.loads(row.get("allowed_agents") or "[]"),
+            "is_admin": bool(row.get("is_admin")),
+        },
+        "active": bool(row.get("active")),
+        "created_at": row.get("created_at"),
+        "expires_at": row.get("expires_at"),
+        "revoked": not bool(row.get("active")),
+    }
+
+
+@app.post("/me/keys")
+def create_me_key(
+    req: CreateUserKeyRequest,
+    cf_access_jwt: Optional[str] = Header(None, alias="Cf-Access-Jwt-Assertion"),
+):
+    email = require_jwt_email(cf_access_jwt)
+    if not req.name or not _USER_KEY_NAME_RE.match(req.name):
+        raise HTTPException(
+            status_code=422,
+            detail="name must be 1-64 chars of [A-Za-z0-9_.-]",
+        )
+
+    # Soft cap on active keys per email.
+    owned = _list_keys_for_owner(email)
+    active_count = sum(1 for r in owned if _key_active(r))
+    if active_count >= _USER_KEY_MAX_ACTIVE:
+        raise HTTPException(
+            status_code=429, detail=f"Max {_USER_KEY_MAX_ACTIVE} active keys per user"
+        )
+
+    # Duplicate name: 409 if the SAME owner already has this name. (Cross-owner
+    # name collisions would also collide on the global UNIQUE(name) constraint,
+    # which surfaces as a generic 500; we don't expose other users' name
+    # existence here.)
+    for r in owned:
+        if r.get("name") == req.name:
+            raise HTTPException(status_code=409, detail="Key name already in use")
+
+    permission = _user_key_permission()
+    import secrets as _secrets
+    raw_key = _secrets.token_urlsafe(32)
+    key_hash = access_control.hash_key(raw_key)
+    created_at = datetime.now()
+    expires_at = created_at + _td_user_tokens(days=_USER_KEY_TTL_DAYS)
+    try:
+        db.save_api_key(
+            {
+                "key_hash": key_hash,
+                "name": req.name,
+                "can_register": permission.can_register,
+                "can_assign_tasks": permission.can_assign_tasks,
+                "can_view_agents": permission.can_view_agents,
+                "can_view_tasks": permission.can_view_tasks,
+                "allowed_agents": permission.allowed_agents,
+                "is_admin": permission.is_admin,
+                "active": True,
+                "created_at": created_at.isoformat(),
+                "expires_at": expires_at.isoformat(),
+            },
+            owner=email,
+        )
+    except Exception as exc:
+        # Most likely a UNIQUE(name) collision against another owner's key.
+        raise HTTPException(status_code=409, detail=f"Could not create key: {exc}")
+    db.log_activity("key", req.name, "created", {"owner": email})
+
+    return {
+        "api_key": raw_key,
+        "name": req.name,
+        "owner": email,
+        "permission": permission.model_dump(),
+        "created_at": created_at.isoformat(),
+        "expires_at": expires_at.isoformat(),
+    }
+
+
+@app.get("/me/keys")
+def list_me_keys(
+    cf_access_jwt: Optional[str] = Header(None, alias="Cf-Access-Jwt-Assertion"),
+):
+    email = require_jwt_email(cf_access_jwt)
+    return [_key_row_to_public(r) for r in _list_keys_for_owner(email)]
+
+
+@app.delete("/me/keys/{name}")
+def revoke_me_key(
+    name: str,
+    cf_access_jwt: Optional[str] = Header(None, alias="Cf-Access-Jwt-Assertion"),
+):
+    email = require_jwt_email(cf_access_jwt)
+    # 404 if not present OR not owned by caller (don't leak existence).
+    owned_names = {r.get("name") for r in _list_keys_for_owner(email)}
+    if name not in owned_names:
+        raise HTTPException(status_code=404, detail="Key not found")
+    if not access_control.revoke_key(name):
+        raise HTTPException(status_code=404, detail="Key not found")
+    return {"status": "revoked", "name": name}
+
+
+def _usage_aggregates(rows: list[dict]) -> dict:
+    """Compute aggregates over already-filtered rows.
+
+    by_day uses Python `completed_at[:10]` bucketing (design v3 Finding 2 — do
+    NOT use SQLite substr).
+    """
+    by_day: dict[str, dict] = {}
+    by_agent: dict[str, dict] = {}
+    total_cost = 0.0
+    total_input = 0
+    total_output = 0
+    total_duration = 0.0
+    top_level_n = 0
+    delegated_n = 0
+    for row in rows:
+        completed = row.get("completed_at")
+        day = (
+            completed[:10]
+            if isinstance(completed, str) and len(completed) >= 10
+            else None
+        )
+        cost = row.get("cost_usd") or 0.0
+        if day is not None:
+            slot = by_day.setdefault(day, {"day": day, "cost_usd": 0.0, "count": 0})
+            slot["cost_usd"] += cost
+            slot["count"] += 1
+        agent_id = row.get("agent_id") or ""
+        a_slot = by_agent.setdefault(
+            agent_id, {"agent_id": agent_id, "cost_usd": 0.0, "count": 0}
+        )
+        a_slot["cost_usd"] += cost
+        a_slot["count"] += 1
+        total_cost += cost
+        if row.get("input_tokens"):
+            total_input += int(row["input_tokens"])
+        if row.get("output_tokens"):
+            total_output += int(row["output_tokens"])
+        if row.get("duration_seconds"):
+            total_duration += float(row["duration_seconds"])
+        if row.get("parent_task_id"):
+            delegated_n += 1
+        else:
+            top_level_n += 1
+    return {
+        "by_day": sorted(by_day.values(), key=lambda x: x["day"]),
+        "by_agent": sorted(by_agent.values(), key=lambda x: x["agent_id"]),
+        "total_cost_usd": total_cost,
+        "total_count": len(rows),
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
+        "total_duration_seconds": total_duration,
+        "top_level_row_count": top_level_n,
+        "delegated_row_count": delegated_n,
+    }
+
+
+def _parse_usage_query(
+    from_: Optional[str], to_: Optional[str], limit: Optional[int]
+) -> tuple[datetime, datetime, int]:
+    now = datetime.now()
+    from_dt = _parse_datetime(from_) if from_ else now - _td_user_tokens(days=30)
+    to_dt = _parse_datetime(to_) if to_ else now
+    eff_limit = limit if limit is not None else 1000
+    try:
+        eff_limit = int(eff_limit)
+    except (TypeError, ValueError):
+        eff_limit = 1000
+    eff_limit = max(1, min(eff_limit, 1000))
+    return from_dt, to_dt, eff_limit
+
+
+@app.get("/me/usage")
+def get_me_usage(
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = None,
+    agent: Optional[str] = None,
+    top_level_only: bool = False,
+    limit: Optional[int] = None,
+    cf_access_jwt: Optional[str] = Header(None, alias="Cf-Access-Jwt-Assertion"),
+):
+    email = require_jwt_email(cf_access_jwt)
+    from_dt, to_dt, eff_limit = _parse_usage_query(from_, to, limit)
+    rows = db.list_task_usage(
+        owner=email,
+        agent=agent,
+        from_dt=from_dt.isoformat() if from_dt else None,
+        to_dt=to_dt.isoformat() if to_dt else None,
+        top_level_only=top_level_only,
+        limit=eff_limit,
+    )
+    aggs = _usage_aggregates(rows)
+    return {
+        "rows": rows,
+        "by_day": aggs["by_day"],
+        "by_agent": aggs["by_agent"],
+        "total_cost_usd": aggs["total_cost_usd"],
+        "total_count": aggs["total_count"],
+        "total_input_tokens": aggs["total_input_tokens"],
+        "total_output_tokens": aggs["total_output_tokens"],
+        "total_duration_seconds": aggs["total_duration_seconds"],
+        "top_level_row_count": aggs["top_level_row_count"],
+        "delegated_row_count": aggs["delegated_row_count"],
+        "from": from_dt.isoformat() if from_dt else None,
+        "to": to_dt.isoformat() if to_dt else None,
+        "limit": eff_limit,
+    }
+
+
+@app.get("/admin/usage")
+def get_admin_usage(
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = None,
+    agent: Optional[str] = None,
+    email: Optional[str] = None,
+    top_level_only: bool = False,
+    limit: Optional[int] = None,
+    authorization: Optional[str] = Header(None),
+):
+    require_admin(authorization)
+    from_dt, to_dt, eff_limit = _parse_usage_query(from_, to, limit)
+    filt_email = (email or "").lower().strip() or None
+    rows = db.list_task_usage(
+        owner=filt_email,
+        agent=agent,
+        from_dt=from_dt.isoformat() if from_dt else None,
+        to_dt=to_dt.isoformat() if to_dt else None,
+        top_level_only=top_level_only,
+        limit=eff_limit,
+    )
+    aggs = _usage_aggregates(rows)
+    return {
+        "rows": rows,
+        "by_day": aggs["by_day"],
+        "by_agent": aggs["by_agent"],
+        "total_cost_usd": aggs["total_cost_usd"],
+        "total_count": aggs["total_count"],
+        "total_input_tokens": aggs["total_input_tokens"],
+        "total_output_tokens": aggs["total_output_tokens"],
+        "total_duration_seconds": aggs["total_duration_seconds"],
+        "top_level_row_count": aggs["top_level_row_count"],
+        "delegated_row_count": aggs["delegated_row_count"],
+        "from": from_dt.isoformat() if from_dt else None,
+        "to": to_dt.isoformat() if to_dt else None,
+        "limit": eff_limit,
+    }
 
 
 # --- Dashboard static mount (phase dashboard-v1) ---

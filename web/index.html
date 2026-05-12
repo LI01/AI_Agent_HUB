@@ -8,6 +8,7 @@
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
   <style>
     @keyframes sse-pulse {
       0%   { box-shadow: 0 0 0 0 rgba(16,185,129,.6); }
@@ -41,11 +42,154 @@
         <span class="px-2 py-0.5 rounded bg-slate-800/70">Running <span class="text-amber-400 font-medium" x-text="stats?.tasks?.running ?? 0"></span></span>
       </div>
     </div>
+    <div id="me-toggles" class="flex items-center gap-2">
+      <button id="me-keys-toggle" @click="window.dispatchEvent(new CustomEvent('toggle-me-panel', {detail: 'keys'}))" class="text-slate-300 hover:text-white text-xs px-2 py-1 rounded bg-slate-800/70 hover:bg-slate-700">My API Keys</button>
+      <button id="me-usage-toggle" @click="window.dispatchEvent(new CustomEvent('toggle-me-panel', {detail: 'usage'}))" class="text-slate-300 hover:text-white text-xs px-2 py-1 rounded bg-slate-800/70 hover:bg-slate-700">Usage</button>
+    </div>
     <div class="flex items-center gap-2 text-xs">
       <span :class="heartbeatDotClass()" class="inline-block w-2.5 h-2.5 rounded-full" :style="heartbeatDotStyle()"></span>
       <span class="text-slate-300" x-text="heartbeatLabel()"></span>
     </div>
   </header>
+  <div id="me-panels">
+    <section id="me-keys-panel" x-data="meKeys()" x-init="init()" x-show="open" :hidden="!open"
+             class="border-b border-slate-800 bg-slate-950/60 px-4 py-3 text-xs">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-sm font-semibold text-slate-100">My API Keys</div>
+        <button @click="open = false" class="text-slate-400 hover:text-slate-200">close</button>
+      </div>
+
+      <template x-if="error">
+        <div class="mb-3 px-3 py-2 rounded bg-red-900/40 text-red-300" x-text="error"></div>
+      </template>
+
+      <template x-if="newKeyValue">
+        <div class="mb-3 px-3 py-2 rounded bg-amber-900/30 border border-amber-700/60">
+          <div class="text-amber-200 font-medium mb-1">This key is shown ONCE. Copy it now.</div>
+          <div class="flex items-center gap-2">
+            <code class="flex-1 break-all font-mono text-[11px] text-amber-100 bg-slate-900/70 rounded px-2 py-1" x-text="newKeyValue"></code>
+            <button @click="copyKey()" class="text-[11px] px-2 py-1 rounded bg-emerald-700 hover:bg-emerald-600 text-white" x-text="copyLabel"></button>
+            <button @click="newKeyValue = null; copyLabel = 'Copy'" class="text-[11px] text-slate-400 hover:text-slate-200">dismiss</button>
+          </div>
+        </div>
+      </template>
+
+      <div class="mb-3 flex items-end gap-2">
+        <div class="flex-1">
+          <label class="block text-[10px] uppercase tracking-wider text-slate-500 mb-1">New key name</label>
+          <input type="text" x-model="newKeyName" placeholder="e.g. muffinluo-laptop"
+                 @keydown.enter.prevent="createKey()"
+                 class="w-full px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-100 text-xs focus:outline-none focus:border-emerald-500" />
+        </div>
+        <button @click="createKey()" :disabled="creating || !newKeyName"
+                class="text-xs px-3 py-1 rounded bg-emerald-700 hover:bg-emerald-600 disabled:bg-slate-700 disabled:text-slate-500 text-white"
+                x-text="creating ? 'Creating…' : 'Create key'"></button>
+      </div>
+
+      <template x-if="loading">
+        <div class="text-slate-400 italic">Loading…</div>
+      </template>
+
+      <template x-if="!loading && keys.length === 0 && !error">
+        <div class="text-slate-500 italic">No keys yet.</div>
+      </template>
+
+      <template x-if="!loading && keys.length > 0">
+        <table class="w-full text-[11px]">
+          <thead>
+            <tr class="text-left text-slate-500 uppercase tracking-wider text-[10px]">
+              <th class="py-1 pr-2">Name</th>
+              <th class="py-1 pr-2">Owner</th>
+              <th class="py-1 pr-2">Created</th>
+              <th class="py-1 pr-2">Expires</th>
+              <th class="py-1"></th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-800/60">
+            <template x-for="k in keys" :key="k.name">
+              <tr>
+                <td class="py-1 pr-2 font-mono text-slate-200" x-text="k.name"></td>
+                <td class="py-1 pr-2 text-slate-300" x-text="k.owner || '—'"></td>
+                <td class="py-1 pr-2 text-slate-400" x-text="(k.created_at || '').slice(0,19)"></td>
+                <td class="py-1 pr-2 text-slate-400" x-text="(k.expires_at || '').slice(0,19) || '—'"></td>
+                <td class="py-1 text-right">
+                  <button @click="revokeKey(k.name)" class="text-red-400 hover:text-red-300 underline">Revoke</button>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </template>
+    </section>
+    <section id="me-usage-panel" x-data="meUsage()" x-init="init()" x-show="visible" :hidden="!visible" class="border-b border-slate-800 bg-slate-950/60 px-4 py-3 text-xs">
+      <div class="flex flex-wrap items-end gap-3 mb-3">
+        <label class="flex flex-col text-[10px] uppercase tracking-wider text-slate-500">From
+          <input type="date" x-model="filters.from" class="mt-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-100" />
+        </label>
+        <label class="flex flex-col text-[10px] uppercase tracking-wider text-slate-500">To
+          <input type="date" x-model="filters.to" class="mt-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-100" />
+        </label>
+        <label class="flex flex-col text-[10px] uppercase tracking-wider text-slate-500">Agent
+          <input type="text" x-model="filters.agent" placeholder="(any)" class="mt-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-100" />
+        </label>
+        <label class="flex items-center gap-1 text-[11px] text-slate-300">
+          <input type="checkbox" x-model="filters.top_level_only" class="accent-emerald-500" />
+          top-level only
+        </label>
+        <button @click="applyFilters()" class="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs">Apply</button>
+        <template x-if="loading"><span class="text-slate-400">loading…</span></template>
+        <template x-if="error"><span class="text-red-400" x-text="error"></span></template>
+      </div>
+
+      <div class="grid grid-cols-3 gap-3 mb-3">
+        <div class="bg-slate-900/60 rounded p-2"><div class="text-[10px] uppercase tracking-wider text-slate-500">Total cost</div><div class="text-base font-semibold text-emerald-300" x-text="'$' + (totals.total_cost_usd ?? 0).toFixed(4)"></div></div>
+        <div class="bg-slate-900/60 rounded p-2"><div class="text-[10px] uppercase tracking-wider text-slate-500">Total tasks</div><div class="text-base font-semibold text-slate-100" x-text="totals.row_count ?? 0"></div></div>
+        <div class="bg-slate-900/60 rounded p-2"><div class="text-[10px] uppercase tracking-wider text-slate-500">Days w/ activity</div><div class="text-base font-semibold text-slate-100" x-text="byDay.length"></div></div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-3 mb-3">
+        <div class="bg-slate-900/60 rounded p-2"><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Cost per day</div><canvas x-ref="dayCanvas" height="120"></canvas></div>
+        <div class="bg-slate-900/60 rounded p-2"><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Cost by agent</div><canvas x-ref="agentCanvas" height="120"></canvas></div>
+      </div>
+
+      <div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Recent runs</div>
+      <template x-if="rows.length === 0 && !loading">
+        <div class="text-slate-500 italic py-2">No usage in selected range.</div>
+      </template>
+      <template x-if="rows.length > 0">
+        <div class="overflow-x-auto max-h-72">
+          <table class="w-full text-[11px]">
+            <thead class="text-slate-500 uppercase tracking-wider text-[10px]">
+              <tr>
+                <th class="text-left py-1 pr-2 cursor-pointer select-none" @click="sortBy('task_id')">task_id<span x-text="sortKey==='task_id' ? (sortDir==='asc'?' ▲':' ▼') : ''"></span></th>
+                <th class="text-left py-1 pr-2 cursor-pointer select-none" @click="sortBy('parent_task_id')">parent<span x-text="sortKey==='parent_task_id' ? (sortDir==='asc'?' ▲':' ▼') : ''"></span></th>
+                <th class="text-left py-1 pr-2 cursor-pointer select-none" @click="sortBy('agent_id')">agent<span x-text="sortKey==='agent_id' ? (sortDir==='asc'?' ▲':' ▼') : ''"></span></th>
+                <th class="text-left py-1 pr-2 cursor-pointer select-none" @click="sortBy('cli')">cli<span x-text="sortKey==='cli' ? (sortDir==='asc'?' ▲':' ▼') : ''"></span></th>
+                <th class="text-left py-1 pr-2 cursor-pointer select-none" @click="sortBy('status')">status<span x-text="sortKey==='status' ? (sortDir==='asc'?' ▲':' ▼') : ''"></span></th>
+                <th class="text-right py-1 pr-2 cursor-pointer select-none" @click="sortBy('duration_seconds')">dur<span x-text="sortKey==='duration_seconds' ? (sortDir==='asc'?' ▲':' ▼') : ''"></span></th>
+                <th class="text-right py-1 pr-2 cursor-pointer select-none" @click="sortBy('cost_usd')">cost<span x-text="sortKey==='cost_usd' ? (sortDir==='asc'?' ▲':' ▼') : ''"></span></th>
+                <th class="text-left py-1 cursor-pointer select-none" @click="sortBy('completed_at')">completed_at<span x-text="sortKey==='completed_at' ? (sortDir==='asc'?' ▲':' ▼') : ''"></span></th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-800/60">
+              <template x-for="r in sortedRows()" :key="r.task_id">
+                <tr class="text-slate-200">
+                  <td class="py-1 pr-2"><code class="text-[10px] text-slate-400" x-text="(r.task_id || '').slice(0,8)"></code></td>
+                  <td class="py-1 pr-2"><code class="text-[10px] text-slate-400" x-text="r.parent_task_id ? r.parent_task_id.slice(0,8) : ''"></code></td>
+                  <td class="py-1 pr-2" x-text="r.agent_id || '—'"></td>
+                  <td class="py-1 pr-2" x-text="r.cli || '—'"></td>
+                  <td class="py-1 pr-2" x-text="r.status || '—'"></td>
+                  <td class="py-1 pr-2 text-right" x-text="r.duration_seconds != null ? r.duration_seconds.toFixed(1) + 's' : '—'"></td>
+                  <td class="py-1 pr-2 text-right" x-text="r.cost_usd != null ? '$' + r.cost_usd.toFixed(4) : '—'"></td>
+                  <td class="py-1 text-slate-400" x-text="r.completed_at || '—'"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </template>
+    </section>
+  </div>
 
   <!-- Three-pane body -->
   <main class="flex" style="height: calc(100vh - 3.5rem);">
@@ -193,6 +337,214 @@
   </main>
 
   <script>
+    function meUsage() {
+      const isoDay = (d) => d.toISOString().slice(0, 10);
+      const today = new Date();
+      const past = new Date(today.getTime() - 30 * 24 * 3600 * 1000);
+      return {
+        rows: [],
+        byDay: [],
+        byAgent: [],
+        totals: {},
+        loading: false,
+        error: null,
+        visible: false,
+        dayChart: null,
+        agentChart: null,
+        _everRendered: false,
+        filters: {
+          from: isoDay(past),
+          to: isoDay(today),
+          agent: '',
+          top_level_only: false,
+        },
+        sortKey: "completed_at",
+        sortDir: "desc",
+        sortBy(key) {
+          if (this.sortKey === key) {
+            this.sortDir = this.sortDir === 'asc' ? 'desc' : 'asc';
+          } else {
+            this.sortKey = key;
+            this.sortDir = 'desc';
+          }
+        },
+        sortedRows() {
+          const k = this.sortKey;
+          const dir = this.sortDir === 'asc' ? 1 : -1;
+          return [...this.rows].sort((a, b) => {
+            const av = a[k]; const bv = b[k];
+            if (av == null && bv == null) return 0;
+            if (av == null) return 1;
+            if (bv == null) return -1;
+            if (av < bv) return -1 * dir;
+            if (av > bv) return 1 * dir;
+            return 0;
+          });
+        },
+        init() {
+          window.addEventListener('toggle-me-panel', (e) => {
+            if (e.detail !== 'usage') return;
+            this.visible = !this.visible;
+            if (this.visible) {
+              this.fetchUsage().then(() => this.$nextTick(() => this.renderCharts()));
+            }
+          });
+        },
+        async fetchUsage() {
+          this.loading = true;
+          this.error = null;
+          try {
+            const qs = new URLSearchParams();
+            if (this.filters.from) qs.set('from', this.filters.from);
+            if (this.filters.to) qs.set('to', this.filters.to + 'T23:59:59.999999');
+            if (this.filters.agent) qs.set('agent', this.filters.agent);
+            if (this.filters.top_level_only) qs.set('top_level_only', 'true');
+            const r = await fetch('/me/usage?' + qs.toString(), { credentials: 'same-origin' });
+            if (r.status === 403) {
+              this.error = 'Sign in via Cloudflare Access to view usage.';
+              this.rows = []; this.byDay = []; this.byAgent = []; this.totals = {};
+              return;
+            }
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const data = await r.json();
+            this.rows = data.rows || [];
+            const agg = data.aggregates || {};
+            this.byDay = agg.by_day || [];
+            this.byAgent = agg.by_agent || [];
+            this.totals = agg;
+          } catch (e) {
+            this.error = 'Failed to load usage: ' + (e.message || e);
+            this.rows = []; this.byDay = []; this.byAgent = []; this.totals = {};
+          } finally {
+            this.loading = false;
+          }
+        },
+        renderCharts() {
+          if (typeof Chart === 'undefined') return;
+          const dayEl = this.$refs.dayCanvas;
+          const agentEl = this.$refs.agentCanvas;
+          if (!dayEl || !agentEl) return;
+          if (this.dayChart) { try { this.dayChart.destroy(); } catch {} this.dayChart = null; }
+          if (this.agentChart) { try { this.agentChart.destroy(); } catch {} this.agentChart = null; }
+          this.dayChart = new Chart(dayEl, {
+            type: 'bar',
+            data: {
+              labels: this.byDay.map(d => d.day),
+              datasets: [{ label: 'cost USD', data: this.byDay.map(d => d.cost_usd || 0), backgroundColor: '#10b981' }],
+            },
+            options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#cbd5e1' } } }, scales: { x: { ticks: { color: '#94a3b8' } }, y: { ticks: { color: '#94a3b8' } } } },
+          });
+          const palette = ['#14b8a6', '#8b5cf6', '#f97316', '#3b82f6', '#ec4899', '#eab308'];
+          this.agentChart = new Chart(agentEl, {
+            type: 'doughnut',
+            data: {
+              labels: this.byAgent.map(a => a.agent_id || '(none)'),
+              datasets: [{ data: this.byAgent.map(a => a.cost_usd || 0), backgroundColor: this.byAgent.map((_, i) => palette[i % palette.length]) }],
+            },
+            options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#cbd5e1' } } } },
+          });
+          this._everRendered = true;
+        },
+        applyFilters() {
+          this.fetchUsage().then(() => this.$nextTick(() => this.renderCharts()));
+        },
+      };
+    }
+    function meKeys() {
+      return {
+        keys: [],
+        loading: false,
+        creating: false,
+        error: null,
+        newKeyName: '',
+        newKeyValue: null,
+        copyLabel: 'Copy',
+        open: false,
+
+        init() {
+          window.addEventListener('toggle-me-panel', (e) => {
+            if (e.detail !== 'keys') return;
+            this.open = !this.open;
+            if (this.open) this.fetchKeys();
+          });
+        },
+
+        async fetchKeys() {
+          this.loading = true;
+          this.error = null;
+          try {
+            const r = await fetch('/me/keys', { credentials: 'same-origin' });
+            if (r.status === 403) {
+              this.error = 'Sign in via Cloudflare Access to mint a key.';
+              this.keys = [];
+              return;
+            }
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            this.keys = await r.json();
+          } catch (e) {
+            this.error = 'Could not load keys: ' + (e.message || e);
+          } finally {
+            this.loading = false;
+          }
+        },
+
+        async createKey() {
+          if (!this.newKeyName || this.creating) return;
+          this.creating = true;
+          this.error = null;
+          try {
+            const r = await fetch('/me/keys', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name: this.newKeyName }),
+            });
+            if (r.status === 403) { this.error = 'Sign in via Cloudflare Access to mint a key.'; return; }
+            if (r.status === 409) { this.error = 'A key with that name already exists.'; return; }
+            if (r.status === 422) { this.error = 'Invalid name (1-64 chars, [A-Za-z0-9_.-]).'; return; }
+            if (r.status === 429) { this.error = 'Active key quota reached (10 keys).'; return; }
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const body = await r.json();
+            this.newKeyValue = body.api_key;
+            this.copyLabel = 'Copy';
+            this.newKeyName = '';
+            await this.fetchKeys();
+          } catch (e) {
+            this.error = 'Could not create key: ' + (e.message || e);
+          } finally {
+            this.creating = false;
+          }
+        },
+
+        async revokeKey(name) {
+          if (!confirm('Revoke key "' + name + '"? This cannot be undone.')) return;
+          this.error = null;
+          try {
+            const r = await fetch('/me/keys/' + encodeURIComponent(name), {
+              method: 'DELETE',
+              credentials: 'same-origin',
+            });
+            if (r.status === 403) { this.error = 'Sign in via Cloudflare Access.'; return; }
+            if (r.status === 404) { this.error = 'Key not found.'; return; }
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            await this.fetchKeys();
+          } catch (e) {
+            this.error = 'Could not revoke key: ' + (e.message || e);
+          }
+        },
+
+        copyKey() {
+          if (!this.newKeyValue) return;
+          try {
+            navigator.clipboard.writeText(this.newKeyValue);
+            this.copyLabel = 'Copied!';
+            setTimeout(() => { this.copyLabel = 'Copy'; }, 1500);
+          } catch {
+            this.copyLabel = 'Copy failed';
+          }
+        },
+      };
+    }
     function hub() {
       return {
         // ----- state -----

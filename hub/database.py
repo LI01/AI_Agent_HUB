@@ -103,6 +103,7 @@ def init_db():
                 expires_at TEXT
             )
         """)
+        _ensure_column(cursor, "api_keys", "owner", "TEXT")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS agent_groups (
@@ -143,6 +144,42 @@ def init_db():
                 entity_id TEXT,
                 action TEXT,
                 details TEXT
+            )
+        """)
+
+        # phase user-tokens §2.2: per-task usage attribution.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS task_usage (
+                task_id           TEXT PRIMARY KEY,
+                parent_task_id    TEXT,
+                api_key_name      TEXT,
+                owner_email       TEXT,
+                agent_id          TEXT,
+                cli               TEXT,
+                task_type         TEXT,
+                status            TEXT NOT NULL,
+                started_at        TEXT,
+                completed_at      TEXT NOT NULL,
+                duration_seconds  REAL,
+                cost_usd          REAL,
+                input_tokens      INTEGER,
+                output_tokens     INTEGER,
+                web_search_requests INTEGER,
+                created_at        TEXT NOT NULL
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_usage_owner ON task_usage(owner_email)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_usage_agent ON task_usage(agent_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_usage_completed ON task_usage(completed_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_usage_parent ON task_usage(parent_task_id)")
+
+        # phase user-tokens §2.3: restart-safe submitter attribution.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS task_submitters (
+                task_id       TEXT PRIMARY KEY,
+                api_key_name  TEXT,
+                owner_email   TEXT,
+                created_at    TEXT NOT NULL
             )
         """)
 
@@ -441,14 +478,22 @@ def parse_task_row(row: dict) -> dict:
 # ============== API Key Operations ==============
 
 
-def save_api_key(api_key: dict):
+def save_api_key(api_key: dict, owner: Optional[str] = None):
+    """Persist (or replace) an api_keys row.
+
+    `owner` may be passed positionally on the dict (`api_key["owner"]`) or as a
+    kwarg; the kwarg wins when both are present and non-None. NULL is the
+    pre-phase default (admin / agent / MCP / seed keys).
+    """
+    resolved_owner = owner if owner is not None else api_key.get("owner")
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO api_keys
             (key_hash, name, can_register, can_assign_tasks, can_view_agents,
-             can_view_tasks, allowed_agents, is_admin, active, created_at, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             can_view_tasks, allowed_agents, is_admin, active, created_at,
+             expires_at, owner)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             api_key["key_hash"],
             api_key["name"],
@@ -461,6 +506,7 @@ def save_api_key(api_key: dict):
             int(api_key.get("active", True)),
             api_key.get("created_at") or _now(),
             api_key.get("expires_at"),
+            resolved_owner,
         ))
         conn.commit()
 
@@ -571,6 +617,149 @@ def get_stats() -> dict:
                 "timeout": timeout,
             },
         }
+
+
+# ============== Task Usage (phase user-tokens §2.2) ==============
+
+
+_TASK_USAGE_COLUMNS = (
+    "task_id",
+    "parent_task_id",
+    "api_key_name",
+    "owner_email",
+    "agent_id",
+    "cli",
+    "task_type",
+    "status",
+    "started_at",
+    "completed_at",
+    "duration_seconds",
+    "cost_usd",
+    "input_tokens",
+    "output_tokens",
+    "web_search_requests",
+    "created_at",
+)
+
+
+def save_task_usage(row: dict) -> None:
+    """Insert one task_usage row, no-op on duplicate task_id (idempotent re-finalize)."""
+    values = [row.get(c) for c in _TASK_USAGE_COLUMNS]
+    # status and completed_at are NOT NULL; fill safe defaults if caller omitted.
+    status_idx = _TASK_USAGE_COLUMNS.index("status")
+    if not values[status_idx]:
+        values[status_idx] = "completed"
+    completed_idx = _TASK_USAGE_COLUMNS.index("completed_at")
+    if not values[completed_idx]:
+        values[completed_idx] = _now()
+    created_idx = _TASK_USAGE_COLUMNS.index("created_at")
+    if not values[created_idx]:
+        values[created_idx] = _now()
+    placeholders = ", ".join("?" for _ in _TASK_USAGE_COLUMNS)
+    columns = ", ".join(_TASK_USAGE_COLUMNS)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"INSERT OR IGNORE INTO task_usage ({columns}) VALUES ({placeholders})",
+            values,
+        )
+        conn.commit()
+
+
+def list_task_usage(
+    owner: Optional[str] = None,
+    agent: Optional[str] = None,
+    from_dt: Optional[str] = None,
+    to_dt: Optional[str] = None,
+    email: Optional[str] = None,
+    top_level_only: bool = False,
+    limit: int = 1000,
+) -> list[dict]:
+    """List task_usage rows, ordered by completed_at DESC.
+
+    `owner` and `email` are aliases for filtering on `owner_email`; `email`
+    wins if both are provided.
+    """
+    clauses: list[str] = []
+    params: list = []
+    effective_owner = email if email else owner
+    if effective_owner:
+        clauses.append("owner_email = ?")
+        params.append(effective_owner)
+    if agent:
+        clauses.append("agent_id = ?")
+        params.append(agent)
+    if from_dt:
+        clauses.append("completed_at >= ?")
+        params.append(from_dt)
+    if to_dt:
+        clauses.append("completed_at <= ?")
+        params.append(to_dt)
+    if top_level_only:
+        clauses.append("parent_task_id IS NULL")
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        n = 1000
+    n = max(1, min(1000, n))
+    sql = f"SELECT * FROM task_usage{where} ORDER BY completed_at DESC LIMIT ?"
+    params.append(n)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(sql, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+
+# ============== Task Submitters (phase user-tokens §2.3) ==============
+
+
+def record_submitter(
+    task_id: str,
+    api_key_name: Optional[str],
+    owner_email: Optional[str],
+) -> None:
+    """INSERT OR REPLACE — used by submit_task and submit_child (parent->child propagation)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO task_submitters (task_id, api_key_name, owner_email, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, api_key_name, owner_email, _now()),
+        )
+        conn.commit()
+
+
+def peek_submitter(task_id: str) -> Optional[dict]:
+    """Read submitter row without deleting. Returns None if missing."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT api_key_name, owner_email FROM task_submitters WHERE task_id = ?",
+            (task_id,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def pop_submitter(task_id: str) -> Optional[dict]:
+    """Read-and-delete in a single transaction. Idempotent: returns None on missing rows.
+
+    Called from finalize_task and from `_rollback_child` (design §3.8) — never
+    raises so it is safe to call unconditionally during rollback cleanup.
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT api_key_name, owner_email FROM task_submitters WHERE task_id = ?",
+            (task_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        cursor.execute("DELETE FROM task_submitters WHERE task_id = ?", (task_id,))
+        conn.commit()
+        return result
 
 
 init_db()
