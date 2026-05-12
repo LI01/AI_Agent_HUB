@@ -43,8 +43,8 @@
       </div>
     </div>
     <div id="me-toggles" class="flex items-center gap-2">
-      <button id="me-keys-toggle" @click="window.dispatchEvent(new CustomEvent('toggle-me-panel', {detail: 'keys'}))" class="text-slate-300 hover:text-white text-xs px-2 py-1 rounded bg-slate-800/70 hover:bg-slate-700">My API Keys</button>
-      <button id="me-usage-toggle" @click="window.dispatchEvent(new CustomEvent('toggle-me-panel', {detail: 'usage'}))" class="text-slate-300 hover:text-white text-xs px-2 py-1 rounded bg-slate-800/70 hover:bg-slate-700">Usage</button>
+      <button id="me-keys-toggle" @click="$store.mePanels.keys = !$store.mePanels.keys" class="text-slate-300 hover:text-white text-xs px-2 py-1 rounded bg-slate-800/70 hover:bg-slate-700">My API Keys</button>
+      <button id="me-usage-toggle" @click="$store.mePanels.usage = !$store.mePanels.usage" class="text-slate-300 hover:text-white text-xs px-2 py-1 rounded bg-slate-800/70 hover:bg-slate-700">Usage</button>
     </div>
     <div class="flex items-center gap-2 text-xs">
       <span :class="heartbeatDotClass()" class="inline-block w-2.5 h-2.5 rounded-full" :style="heartbeatDotStyle()"></span>
@@ -52,11 +52,11 @@
     </div>
   </header>
   <div id="me-panels">
-    <section id="me-keys-panel" x-data="meKeys()" x-init="init()" x-show="open" :hidden="!open"
+    <section id="me-keys-panel" x-data="meKeys()" x-init="init()" x-show="$store.mePanels.keys" :hidden="!$store.mePanels.keys"
              class="border-b border-slate-800 bg-slate-950/60 px-4 py-3 text-xs">
       <div class="flex items-center justify-between mb-3">
         <div class="text-sm font-semibold text-slate-100">My API Keys</div>
-        <button @click="open = false" class="text-slate-400 hover:text-slate-200">close</button>
+        <button @click="$store.mePanels.keys = false" class="text-slate-400 hover:text-slate-200">close</button>
       </div>
 
       <template x-if="error">
@@ -121,7 +121,7 @@
         </table>
       </template>
     </section>
-    <section id="me-usage-panel" x-data="meUsage()" x-init="init()" x-show="visible" :hidden="!visible" class="border-b border-slate-800 bg-slate-950/60 px-4 py-3 text-xs">
+    <section id="me-usage-panel" x-data="meUsage()" x-init="init()" x-show="$store.mePanels.usage" :hidden="!$store.mePanels.usage" class="border-b border-slate-800 bg-slate-950/60 px-4 py-3 text-xs">
       <div class="flex flex-wrap items-end gap-3 mb-3">
         <label class="flex flex-col text-[10px] uppercase tracking-wider text-slate-500">From
           <input type="date" x-model="filters.from" class="mt-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-100" />
@@ -337,6 +337,13 @@
   </main>
 
   <script>
+    document.addEventListener('alpine:init', () => {
+      // Single source of truth for header-button toggles → panel visibility.
+      // Both buttons and panels read/write the same store entries, so toggle
+      // works regardless of cross-component event timing.
+      Alpine.store('mePanels', { keys: false, usage: false });
+    });
+
     function meUsage() {
       const isoDay = (d) => d.toISOString().slice(0, 10);
       const today = new Date();
@@ -382,10 +389,8 @@
           });
         },
         init() {
-          window.addEventListener('toggle-me-panel', (e) => {
-            if (e.detail !== 'usage') return;
-            this.visible = !this.visible;
-            if (this.visible) {
+          this.$watch('$store.mePanels.usage', (val) => {
+            if (val) {
               this.fetchUsage().then(() => this.$nextTick(() => this.renderCharts()));
             }
           });
@@ -462,10 +467,8 @@
         open: false,
 
         init() {
-          window.addEventListener('toggle-me-panel', (e) => {
-            if (e.detail !== 'keys') return;
-            this.open = !this.open;
-            if (this.open) this.fetchKeys();
+          this.$watch('$store.mePanels.keys', (val) => {
+            if (val) this.fetchKeys();
           });
         },
 
