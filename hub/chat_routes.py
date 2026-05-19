@@ -194,15 +194,16 @@ def api_list_files(
 
 @chat_router.post("/upload")
 async def api_upload_file(
+    request: Request,
     path: str = Query(...),
     cf_access_jwt: Optional[str] = Header(None, alias="Cf-Access-Jwt-Assertion"),
 ):
-    """Upload a file (base64 content in request body)."""
+    """Upload a file (raw bytes in request body)."""
     email = _require_chat_jwt(cf_access_jwt)
     user = _ensure_user(email)
     ws = get_workspace()
     user_path = ws.get_user_path(user["id"])
-    body = await Request.__class__.body  # placeholder — read raw body
+    body = await request.body()
     try:
         ws.write_file(user_path, path, body)
         return {"status": "uploaded", "path": path}
@@ -322,7 +323,7 @@ def admin_create_agent(
     install_cmd = f"AGENT_HUB_API_KEY={raw_key} AGENT_HUB_URL={hub_url} bash scripts/install_agent_services.sh"
 
     return {
-        "agent_id": f"{req.cli}-{req.role}-hostname",
+        "agent_id": f"{req.cli}-{req.role}-{os.uname().nodename}",
         "api_key": raw_key,
         "install_command": install_cmd,
     }
