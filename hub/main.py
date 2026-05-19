@@ -47,6 +47,7 @@ from .mcp_protocol import InProcessHubBackend, handle_jsonrpc
 from . import cf_access as _cf_access_mod
 from pydantic import ValidationError
 from .chat_routes import chat_router, admin_chat_router
+from .chat_ws import chat_websocket_endpoint
 
 
 app = FastAPI(title="Agent Hub")
@@ -926,6 +927,21 @@ async def websocket_endpoint(websocket: WebSocket):
                 db.requeue_tasks_for_agent(disconnected)
                 db.log_activity("agent", disconnected, "disconnected", {"requeued": [t.task_id for t in requeued]})
                 emit_event("agent_status", {"agent_id": disconnected, "status": AgentStatus.OFFLINE.value})
+
+
+@app.websocket("/chat/ws")
+async def chat_ws(websocket: WebSocket, token: str = Query(None)):
+    await chat_websocket_endpoint(
+        websocket,
+        token,
+        cf_access_verifier=cf_access_verifier,
+        admin_emails=_get_admin_emails_for_chat(),
+    )
+
+
+def _get_admin_emails_for_chat() -> list[str]:
+    raw = os.getenv("AGENT_HUB_ADMIN_EMAILS", "")
+    return [e.strip().lower() for e in raw.split(",") if e.strip()]
 
 
 async def handle_agent_message(agent_id: str, msg: dict):
