@@ -1,10 +1,12 @@
 """Test chat_models Pydantic validation."""
 import pytest
+from pydantic import ValidationError
 from hub.chat_models import (
     ChatMessageRequest,
     CreateConversationRequest,
     CreateAgentRequest,
     ScoreSubmissionRequest,
+    UploadFileRequest,
 )
 
 
@@ -51,6 +53,18 @@ def test_score_submission_request():
     assert req.feedback == "good work"
 
 
-def test_score_out_of_range():
-    with pytest.raises(Exception):
+def test_score_boundaries():
+    """Score 0 and 100 are valid; -1 and 101 raise ValidationError."""
+    assert ScoreSubmissionRequest(score=0).score == 0
+    assert ScoreSubmissionRequest(score=100).score == 100
+    with pytest.raises(ValidationError):
+        ScoreSubmissionRequest(score=-1)
+    with pytest.raises(ValidationError):
         ScoreSubmissionRequest(score=101)
+
+
+def test_upload_file_request():
+    req = UploadFileRequest(path="src/main.py", content_base64="cHJpbnQoJ2hpJyk=", size=14)
+    assert req.path == "src/main.py"
+    assert req.content_base64 == "cHJpbnQoJ2hpJyk="
+    assert req.size == 14
