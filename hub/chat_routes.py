@@ -77,14 +77,18 @@ def _require_admin_jwt(cf_access_jwt: Optional[str]) -> dict:
 @chat_router.get("/templates")
 def api_list_templates(
     role: Optional[str] = Query(None),
+    cf_access_jwt: Optional[str] = Header(None, alias="Cf-Access-Jwt-Assertion"),
 ):
+    _require_chat_jwt(cf_access_jwt)
     return chat_db.list_task_templates(role)
 
 
 @chat_router.get("/templates/{template_id}")
 def api_get_template(
     template_id: str,
+    cf_access_jwt: Optional[str] = Header(None, alias="Cf-Access-Jwt-Assertion"),
 ):
+    _require_chat_jwt(cf_access_jwt)
     tpl = chat_db.get_task_template(template_id)
     if not tpl:
         raise HTTPException(status_code=404, detail="Template not found")
@@ -204,6 +208,9 @@ async def api_upload_file(
     ws = get_workspace()
     user_path = ws.get_user_path(user["id"])
     body = await request.body()
+    max_size = int(os.getenv("AGENT_HUB_CHAT_MAX_FILE_SIZE", "10485760"))
+    if len(body) > max_size:
+        raise HTTPException(status_code=413, detail=f"File too large (max {max_size} bytes)")
     try:
         ws.write_file(user_path, path, body)
         return {"status": "uploaded", "path": path}

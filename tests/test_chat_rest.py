@@ -9,11 +9,10 @@ def client():
     return TestClient(app)
 
 
-def test_get_chat_templates(client):
-    """GET /chat/templates returns template list."""
+def test_get_chat_templates_requires_auth(client):
+    """GET /chat/templates requires CF Access JWT."""
     resp = client.get("/chat/templates")
-    # Should return 200 (empty list if no templates seeded, or populated list)
-    assert resp.status_code == 200
+    assert resp.status_code == 403
 
 
 def test_create_conversation_requires_auth(client):

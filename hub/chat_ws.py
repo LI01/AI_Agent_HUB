@@ -66,6 +66,9 @@ async def _handle_chat_message(websocket: WebSocket, user: dict, msg: dict):
     if not conv or conv["user_id"] != user["id"]:
         await websocket.send_json({"type": "error", "message": "conversation not found"})
         return
+    if conv["status"] == "submitted":
+        await websocket.send_json({"type": "error", "message": "conversation is submitted and read-only"})
+        return
 
     user_msg = chat_db.create_message(
         conversation_id=conversation_id,

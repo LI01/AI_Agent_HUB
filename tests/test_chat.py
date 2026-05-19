@@ -89,9 +89,9 @@ class TestChatFiles:
 class TestChatEndpoints:
     """Test chat REST endpoints."""
 
-    def test_templates_endpoint(self, client):
+    def test_templates_endpoint_requires_auth(self, client):
         resp = client.get("/chat/templates")
-        assert resp.status_code == 200
+        assert resp.status_code == 403
 
     def test_conversations_requires_auth(self, client):
         resp = client.get("/chat/conversations")
