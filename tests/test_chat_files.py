@@ -75,3 +75,28 @@ def test_delete_file(manager):
     manager.write_file(user_path, "to_delete.txt", b"bye")
     manager.delete_file(user_path, "to_delete.txt")
     assert not os.path.exists(os.path.join(user_path, "to_delete.txt"))
+
+
+def test_resolve_path_blocks_prefix_collision():
+    """user-123 must not match user-123-evil via startswith."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = WorkspaceManager(tmpdir)
+        user_path = mgr.get_user_path("user")
+        evil_path = mgr.get_user_path("user-evil")
+        # Even though "user-evil" starts with "user", resolve_path must block it
+        with pytest.raises(ValueError):
+            mgr.resolve_path(user_path, "../user-evil/file.txt")
+
+
+def test_resolve_path_blocks_mixed_traversal():
+    """Mixed traversal like foo/../../etc must be blocked."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = WorkspaceManager(tmpdir)
+        user_path = mgr.get_user_path("user-123")
+        with pytest.raises(ValueError):
+            mgr.resolve_path(user_path, "foo/../../etc/passwd")
+
+
+def test_sanitize_path_rejects_empty():
+    with pytest.raises(ValueError):
+        sanitize_path("")

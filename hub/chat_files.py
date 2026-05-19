@@ -35,7 +35,9 @@ class WorkspaceManager:
         """Resolve a relative path within the user's workspace. Raises on traversal."""
         clean = sanitize_path(relative_path)
         full = os.path.normpath(os.path.join(user_path, clean))
-        if not full.startswith(os.path.normpath(user_path)):
+        user_norm = os.path.normpath(user_path)
+        # Append separator to prevent prefix collision: /workspace/user must not match /workspace/user-evil
+        if not (full == user_norm or full.startswith(user_norm + os.sep)):
             raise ValueError("path escapes user workspace")
         return full
 
