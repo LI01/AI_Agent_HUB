@@ -189,6 +189,73 @@ def init_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_entity ON activity_log(entity_type, entity_id)")
+
+        # Chat training platform tables
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_users (
+                id TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                name TEXT,
+                avatar_url TEXT,
+                role TEXT,
+                group_number INTEGER,
+                is_admin INTEGER DEFAULT 0,
+                is_instructor INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_conversations (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES chat_users(id),
+                title TEXT,
+                agent_id TEXT NOT NULL,
+                task_template_id TEXT,
+                status TEXT DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES chat_conversations(id),
+                role TEXT NOT NULL,
+                content TEXT,
+                files TEXT,
+                task_id TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_submissions (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL REFERENCES chat_conversations(id),
+                user_id TEXT NOT NULL REFERENCES chat_users(id),
+                submitted_at TEXT NOT NULL,
+                score INTEGER,
+                feedback TEXT,
+                status TEXT DEFAULT 'submitted'
+            )
+        """)
+
+        # Extend existing task_templates for training use
+        _ensure_column(cursor, "task_templates", "role", "TEXT")
+        _ensure_column(cursor, "task_templates", "expected_output", "TEXT")
+        _ensure_column(cursor, "task_templates", "skill_template", "TEXT")
+        _ensure_column(cursor, "task_templates", "time_limit_minutes", "INTEGER")
+        _ensure_column(cursor, "task_templates", "sort_order", "INTEGER DEFAULT 0")
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_conv_user ON chat_conversations(user_id, updated_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_msg_conv ON chat_messages(conversation_id, created_at ASC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_msg_task ON chat_messages(task_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_sub_user ON chat_submissions(user_id, status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_tpl_role ON task_templates(role, sort_order)")
+
         conn.commit()
     print(f"[db] Database initialized: {DB_PATH}")
 
