@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>嘉骏 AI 培训平台 — 管理</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+  </style>
+</head>
+<body x-data="adminApp()" x-init="init()" class="h-screen overflow-hidden bg-slate-950 text-slate-100" x-cloak>
+
+  <!-- Top bar -->
+  <header class="h-12 flex items-center justify-between border-b border-slate-800 px-4 bg-slate-900">
+    <div class="flex items-center gap-3">
+      <span class="text-sm font-semibold">嘉骏 AI 培训平台 — 管理</span>
+    </div>
+    <div class="flex items-center gap-2 text-xs">
+      <span x-text="userEmail" class="text-slate-400"></span>
+      <a href="/chat" class="text-blue-400 hover:text-blue-300"> 返回聊天</a>
+    </div>
+  </header>
+
+  <!-- Tabs -->
+  <nav class="flex border-b border-slate-800 bg-slate-900/50">
+    <template x-for="tab in tabs" :key="tab.id">
+      <button @click="activeTab = tab.id"
+              class="px-4 py-2 text-xs font-medium border-b-2 transition-colors"
+              :class="activeTab === tab.id ? 'border-blue-500 text-blue-400' : 'border-transparent text-slate-400 hover:text-slate-200'"
+              x-text="tab.label"></button>
+    </template>
+  </nav>
+
+  <!-- Dashboard Tab -->
+  <div x-show="activeTab === 'dashboard'" class="flex-1 overflow-y-auto p-6">
+    <div class="grid grid-cols-4 gap-4 mb-6">
+      <div class="bg-slate-800 rounded-lg p-4">
+        <div class="text-2xl font-bold" x-text="dashboard.total_users || 0"></div>
+        <div class="text-xs text-slate-400">在线学员</div>
+      </div>
+      <div class="bg-slate-800 rounded-lg p-4">
+        <div class="text-2xl font-bold" x-text="dashboard.total_conversations || 0"></div>
+        <div class="text-xs text-slate-400">对话数</div>
+      </div>
+      <div class="bg-slate-800 rounded-lg p-4">
+        <div class="text-2xl font-bold" x-text="dashboard.total_submissions || 0"></div>
+        <div class="text-xs text-slate-400">提交数</div>
+      </div>
+    </div>
+    <h3 class="text-sm font-semibold mb-3">各小组进度</h3>
+    <template x-for="(stats, role) in dashboard.by_role" :key="role">
+      <div class="mb-3">
+        <div class="flex justify-between text-xs mb-1">
+          <span x-text="roleLabel(role)"></span>
+          <span><span x-text="stats.users"></span> 人 · <span x-text="stats.conversations"></span> 对话 · <span x-text="stats.submitted"></span> 提交</span>
+        </div>
+        <div class="h-2 bg-slate-700 rounded-full overflow-hidden">
+          <div class="h-full bg-blue-500 rounded-full" :style="`width: ${stats.users > 0 ? (stats.submitted / stats.users * 100) : 0}%`"></div>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <!-- Users Tab -->
+  <div x-show="activeTab === 'users'" class="flex-1 overflow-y-auto p-6">
+    <div class="mb-4 flex items-center gap-2">
+      <input x-model="userSearch" placeholder="搜索邮箱或姓名..." class="bg-slate-800 border border-slate-700 rounded px-3 py-1.5 text-xs w-64 focus:outline-none focus:border-blue-500">
+    </div>
+    <table class="w-full text-xs">
+      <thead>
+        <tr class="text-left text-slate-400 border-b border-slate-700">
+          <th class="pb-2">邮箱</th>
+          <th class="pb-2">姓名</th>
+          <th class="pb-2">角色</th>
+          <th class="pb-2">最后活跃</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="user in filteredUsers" :key="user.id">
+          <tr class="border-b border-slate-800/50 hover:bg-slate-800/30">
+            <td class="py-2 font-mono" x-text="user.email"></td>
+            <td class="py-2" x-text="user.name || '—'"></td>
+            <td class="py-2" x-text="roleLabel(user.role)"></td>
+            <td class="py-2 text-slate-400" x-text="user.last_seen_at"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Agents Tab -->
+  <div x-show="activeTab === 'agents'" class="flex-1 overflow-y-auto p-6">
+    <div class="mb-4">
+      <button @click="showCreateAgent = true" class="text-xs px-3 py-2 rounded bg-blue-600 hover:bg-blue-500 text-white">+ 新建 Agent</button>
+    </div>
+    <table class="w-full text-xs">
+      <thead>
+        <tr class="text-left text-slate-400 border-b border-slate-700">
+          <th class="pb-2">Agent ID</th>
+          <th class="pb-2">名称</th>
+          <th class="pb-2">状态</th>
+          <th class="pb-2">能力</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="agent in agents" :key="agent.agent_id">
+          <tr class="border-b border-slate-800/50 hover:bg-slate-800/30">
+            <td class="py-2 font-mono" x-text="agent.agent_id"></td>
+            <td class="py-2" x-text="agent.name"></td>
+            <td class="py-2">
+              <span class="px-1.5 py-0.5 rounded text-[10px]"
+                    :class="agent.status === 'idle' ? 'bg-emerald-900/50 text-emerald-300' : agent.status === 'busy' ? 'bg-amber-900/50 text-amber-300' : 'bg-slate-700 text-slate-400'"
+                    x-text="agent.status"></span>
+            </td>
+            <td class="py-2 text-slate-400" x-text="(agent.capabilities || []).join(', ')"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+
+    <!-- Create Agent Modal -->
+    <div x-show="showCreateAgent" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @click.self="showCreateAgent = false">
+      <div class="bg-slate-900 rounded-lg p-6 w-96">
+        <h3 class="text-sm font-semibold mb-4">新建 Agent</h3>
+        <div class="space-y-3">
+          <div><label class="block text-[10px] text-slate-400 mb-1">名称</label><input x-model="newAgent.name" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-xs"></div>
+          <div><label class="block text-[10px] text-slate-400 mb-1">角色</label><select x-model="newAgent.role" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-xs"><option value="coder">Coder</option><option value="reviewer">Reviewer</option><option value="designer">Designer</option><option value="tester">Tester</option></select></div>
+          <div><label class="block text-[10px] text-slate-400 mb-1">CLI</label><select x-model="newAgent.cli" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-xs"><option value="opencode">opencode</option><option value="claude">claude</option><option value="codex">codex</option></select></div>
+        </div>
+        <div class="mt-4 flex gap-2">
+          <button @click="createAgent()" class="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-500 text-xs text-white">创建</button>
+          <button @click="showCreateAgent = false" class="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-xs">取消</button>
+        </div>
+        <div x-show="newAgentKey" class="mt-3 p-2 rounded bg-amber-900/40 text-amber-200 text-[10px]">
+          <div class="font-medium mb-1">API Key（仅显示一次）:</div>
+          <code class="break-all" x-text="newAgentKey"></code>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Submissions Tab -->
+  <div x-show="activeTab === 'submissions'" class="flex-1 overflow-y-auto p-6">
+    <div class="flex gap-2 mb-4">
+      <button @click="subFilter = null" class="text-xs px-2 py-1 rounded" :class="!subFilter ? 'bg-blue-600' : 'bg-slate-700'">全部</button>
+      <button @click="subFilter = 'submitted'" class="text-xs px-2 py-1 rounded" :class="subFilter === 'submitted' ? 'bg-blue-600' : 'bg-slate-700'">待评分</button>
+      <button @click="subFilter = 'reviewed'" class="text-xs px-2 py-1 rounded" :class="subFilter === 'reviewed' ? 'bg-blue-600' : 'bg-slate-700'">已评分</button>
+    </div>
+    <table class="w-full text-xs">
+      <thead>
+        <tr class="text-left text-slate-400 border-b border-slate-700">
+          <th class="pb-2">用户</th>
+          <th class="pb-2">提交时间</th>
+          <th class="pb-2">状态</th>
+          <th class="pb-2">分数</th>
+          <th class="pb-2">操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="sub in filteredSubmissions" :key="sub.id">
+          <tr class="border-b border-slate-800/50 hover:bg-slate-800/30">
+            <td class="py-2 font-mono" x-text="sub.user_id"></td>
+            <td class="py-2" x-text="sub.submitted_at"></td>
+            <td class="py-2" x-text="sub.status"></td>
+            <td class="py-2" x-text="sub.score ?? '—'"></td>
+            <td class="py-2">
+              <button x-show="sub.status === 'submitted'" @click="openScoreModal(sub)" class="text-blue-400 hover:text-blue-300">评分</button>
+            </td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+
+    <!-- Score Modal -->
+    <div x-show="showScoreModal" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @click.self="showScoreModal = false">
+      <div class="bg-slate-900 rounded-lg p-6 w-96">
+        <h3 class="text-sm font-semibold mb-4">评分</h3>
+        <div class="space-y-3">
+          <div><label class="block text-[10px] text-slate-400 mb-1">分数 (0-100)</label><input type="number" x-model.number="scoreForm.score" min="0" max="100" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-xs"></div>
+          <div><label class="block text-[10px] text-slate-400 mb-1">反馈</label><textarea x-model="scoreForm.feedback" rows="3" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-xs resize-none"></textarea></div>
+        </div>
+        <div class="mt-4 flex gap-2">
+          <button @click="submitScore()" class="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-xs text-white">提交</button>
+          <button @click="showScoreModal = false" class="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-xs">取消</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function adminApp() {
+      return {
+        userEmail: '',
+        jwt: '',
+        activeTab: 'dashboard',
+        tabs: [
+          { id: 'dashboard', label: ' 看板' },
+          { id: 'users', label: ' 学员' },
+          { id: 'agents', label: ' Agents' },
+          { id: 'submissions', label: ' 作业' },
+        ],
+        dashboard: {},
+        users: [],
+        userSearch: '',
+        agents: [],
+        showCreateAgent: false,
+        newAgent: { name: '', role: 'coder', cli: 'opencode' },
+        newAgentKey: '',
+        submissions: [],
+        subFilter: null,
+        showScoreModal: false,
+        scoreForm: { subId: '', score: 0, feedback: '' },
+
+        async init() {
+          this.jwt = await this.getJwt()
+          if (!this.jwt) { alert('未登录'); return }
+          try { this.userEmail = JSON.parse(atob(this.jwt.split('.')[1])).email || '' } catch (e) {}
+          await Promise.all([this.loadDashboard(), this.loadUsers(), this.loadAgents(), this.loadSubmissions()])
+        },
+
+        async getJwt() {
+          const meta = document.querySelector('meta[name="cf-access-jwt"]')
+          return meta ? meta.content : ''
+        },
+
+        headers() { return { 'Cf-Access-Jwt-Assertion': this.jwt } },
+
+        async loadDashboard() { const r = await fetch('/admin/chat/dashboard', { headers: this.headers() }); if (r.ok) this.dashboard = await r.json() },
+        async loadUsers() { const r = await fetch('/admin/chat/users', { headers: this.headers() }); if (r.ok) this.users = await r.json() },
+        async loadAgents() { const r = await fetch('/admin/chat/agents', { headers: this.headers() }); if (r.ok) this.agents = await r.json() },
+        async loadSubmissions() { const r = await fetch('/admin/chat/submissions', { headers: this.headers() }); if (r.ok) this.submissions = await r.json() },
+
+        get filteredUsers() {
+          if (!this.userSearch) return this.users
+          const q = this.userSearch.toLowerCase()
+          return this.users.filter(u => (u.email || '').toLowerCase().includes(q) || (u.name || '').toLowerCase().includes(q))
+        },
+
+        get filteredSubmissions() {
+          if (!this.subFilter) return this.submissions
+          return this.submissions.filter(s => s.status === this.subFilter)
+        },
+
+        async createAgent() {
+          const r = await fetch('/admin/chat/agents', {
+            method: 'POST', headers: { ...this.headers(), 'Content-Type': 'application/json' },
+            body: JSON.stringify(this.newAgent)
+          })
+          if (r.ok) {
+            const data = await r.json()
+            this.newAgentKey = data.api_key
+            this.showCreateAgent = false
+            await this.loadAgents()
+          }
+        },
+
+        openScoreModal(sub) { this.scoreForm = { subId: sub.id, score: 0, feedback: '' }; this.showScoreModal = true },
+
+        async submitScore() {
+          const r = await fetch(`/admin/chat/submissions/${this.scoreForm.subId}/score`, {
+            method: 'POST', headers: { ...this.headers(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ score: this.scoreForm.score, feedback: this.scoreForm.feedback })
+          })
+          if (r.ok) { this.showScoreModal = false; await this.loadSubmissions(); await this.loadDashboard() }
+        },
+
+        roleLabel(role) {
+          const labels = { pm: 'PM 组', developer: '开发组', hardware: '硬件组', sales: '销售/管理组', unassigned: '未分配' }
+          return labels[role] || role
+        }
+      }
+    }
+  </script>
+</body>
+</html>

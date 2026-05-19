@@ -75,6 +75,11 @@ app.add_middleware(
 app.include_router(chat_router)
 app.include_router(admin_chat_router)
 
+
+@app.get("/chat/admin")
+async def chat_admin_page():
+    return FileResponse("web/chat_admin.html")
+
 registry = AgentRegistry()
 queue = TaskQueue()
 router = Router(registry, queue)
