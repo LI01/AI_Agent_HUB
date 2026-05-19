@@ -46,6 +46,7 @@ from .router import Router
 from .mcp_protocol import InProcessHubBackend, handle_jsonrpc
 from . import cf_access as _cf_access_mod
 from pydantic import ValidationError
+from .chat_routes import chat_router, admin_chat_router
 
 
 app = FastAPI(title="Agent Hub")
@@ -69,6 +70,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(chat_router)
+app.include_router(admin_chat_router)
 
 registry = AgentRegistry()
 queue = TaskQueue()
