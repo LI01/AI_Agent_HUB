@@ -13,6 +13,8 @@ def _now() -> str:
     return datetime.now().isoformat()
 
 
+# JSON helpers — chat_db needs string passthrough (files may arrive as pre-serialized
+# JSON from the WebSocket layer). database.py's _to_json always dumps. Keep separate.
 def _to_json(value, default=None):
     if value is None:
         return json.dumps(default or {})
@@ -33,28 +35,28 @@ def _from_json(value, default=None):
 # ============== User Operations ==============
 
 def upsert_user(email: str, name: Optional[str] = None, admin_emails: Optional[list[str]] = None) -> dict:
-    """Create or update a user from CF Access JWT claims."""
+    """Create or update a user from CF Access JWT claims.
+
+    Uses INSERT ... ON CONFLICT(email) DO UPDATE for atomicity.
+    Preserves existing id and created_at on update.
+    """
     email = email.lower().strip()
     now = _now()
     is_admin = email in [e.lower().strip() for e in (admin_emails or [])]
+    user_id = str(uuid.uuid4())
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM chat_users WHERE email = ?", (email,))
-        row = cursor.fetchone()
-        if row:
-            cursor.execute(
-                "UPDATE chat_users SET name = ?, last_seen_at = ?, is_admin = ? WHERE email = ?",
-                (name, now, int(is_admin), email),
-            )
-            user_id = row[0]
-        else:
-            user_id = str(uuid.uuid4())
-            cursor.execute(
-                "INSERT INTO chat_users (id, email, name, is_admin, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, email, name, int(is_admin), now, now),
-            )
+        cursor.execute(
+            """INSERT INTO chat_users (id, email, name, is_admin, created_at, last_seen_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(email) DO UPDATE SET
+                   name = excluded.name,
+                   last_seen_at = excluded.last_seen_at,
+                   is_admin = excluded.is_admin""",
+            (user_id, email, name, int(is_admin), now, now),
+        )
         conn.commit()
-    return get_user(user_id)
+    return get_user_by_email(email)
 
 
 def get_user(user_id: str) -> Optional[dict]:
@@ -91,7 +93,8 @@ def update_user_role(user_id: str, role: Optional[str], group_number: Optional[i
         return cursor.rowcount > 0
 
 
-def disable_user(user_id: str) -> bool:
+def revoke_admin(user_id: str) -> bool:
+    """Remove admin privileges from a user."""
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("UPDATE chat_users SET is_admin = 0 WHERE id = ?", (user_id,))
@@ -99,12 +102,18 @@ def disable_user(user_id: str) -> bool:
         return cursor.rowcount > 0
 
 
-def enable_user(user_id: str) -> bool:
+def grant_admin(user_id: str) -> bool:
+    """Grant admin privileges to a user."""
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("UPDATE chat_users SET is_admin = 1 WHERE id = ?", (user_id,))
         conn.commit()
         return cursor.rowcount > 0
+
+
+# Aliases for backwards compatibility with routes that reference disable/enable
+disable_user = revoke_admin
+enable_user = grant_admin
 
 
 # ============== Conversation Operations ==============
