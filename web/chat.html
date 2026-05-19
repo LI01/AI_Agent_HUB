@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>嘉骏 AI 培训平台</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <style>
+    .markdown-body :is(h1,h2,h3) { font-weight: 600; margin: .5em 0 .25em; }
+    .markdown-body h1 { font-size: 1.1rem; }
+    .markdown-body h2 { font-size: 1rem; }
+    .markdown-body h3 { font-size: .9rem; }
+    .markdown-body p { margin: .3em 0; }
+    .markdown-body code { background: rgba(148,163,184,.15); padding: 0 .2rem; border-radius: 3px; font-size: .8rem; }
+    .markdown-body pre { background: rgba(15,23,42,.6); padding: .5rem; border-radius: 4px; overflow-x: auto; font-size: .75rem; }
+    .markdown-body ul, .markdown-body ol { margin: .3em 0 .3em 1.2em; }
+    .markdown-body a { color: #93c5fd; text-decoration: underline; }
+    [x-cloak] { display: none !important; }
+  </style>
+</head>
+<body x-data="chatApp()" x-init="init()" class="h-screen overflow-hidden bg-slate-950 text-slate-100" x-cloak>
+
+  <!-- Top bar -->
+  <header class="h-12 flex items-center justify-between border-b border-slate-800 px-4 bg-slate-900">
+    <div class="flex items-center gap-3">
+      <span class="text-sm font-semibold">嘉骏 AI 培训平台</span>
+      <span class="text-xs text-slate-400" x-text="userRole ? roleLabel(userRole) : ''"></span>
+    </div>
+    <div class="flex items-center gap-2 text-xs">
+      <span x-text="userEmail" class="text-slate-400"></span>
+      <span class="inline-block w-2 h-2 rounded-full" :class="wsConnected ? 'bg-emerald-400' : 'bg-red-400'"></span>
+    </div>
+  </header>
+
+  <div class="flex h-[calc(100vh-3rem)]">
+
+    <!-- Sidebar: Conversations -->
+    <aside class="w-64 border-r border-slate-800 bg-slate-900/50 flex flex-col">
+      <div class="p-3 border-b border-slate-800">
+        <button @click="showAgentPicker = true" class="w-full text-xs px-3 py-2 rounded bg-blue-600 hover:bg-blue-500 text-white font-medium">
+          + 新对话
+        </button>
+      </div>
+      <div class="flex-1 overflow-y-auto">
+        <template x-for="conv in conversations" :key="conv.id">
+          <div @click="selectConversation(conv.id)"
+               class="px-3 py-2 cursor-pointer border-b border-slate-800/50 hover:bg-slate-800/50"
+               :class="conv.id === activeConvId ? 'bg-slate-800 border-l-2 border-l-blue-500' : ''">
+            <div class="text-xs font-medium truncate" x-text="conv.title || '新对话'"></div>
+            <div class="text-[10px] text-slate-500" x-text="conv.agent_id"></div>
+          </div>
+        </template>
+      </div>
+
+      <!-- File browser -->
+      <div class="border-t border-slate-800 p-3">
+        <div class="text-[10px] uppercase tracking-wider text-slate-500 mb-2">📂 工作区</div>
+        <div class="text-xs space-y-1">
+          <template x-for="file in files" :key="file.name">
+            <div class="flex items-center gap-1">
+              <span x-text="file.is_directory ? '📁' : '📄'"></span>
+              <span class="truncate" x-text="file.name"></span>
+            </div>
+          </template>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main: Chat -->
+    <main class="flex-1 flex flex-col">
+      <template x-if="!activeConvId">
+        <div class="flex-1 flex items-center justify-center text-slate-500 text-sm">
+          选择或创建一个对话开始
+        </div>
+      </template>
+
+      <template x-if="activeConvId">
+        <div class="flex-1 flex flex-col">
+          <!-- Messages -->
+          <div id="messages" class="flex-1 overflow-y-auto p-4 space-y-3">
+            <template x-for="msg in messages" :key="msg.id">
+              <div :class="msg.role === 'user' ? 'ml-auto max-w-[70%]' : 'mr-auto max-w-[70%]'">
+                <div class="rounded-lg px-3 py-2 text-sm"
+                     :class="msg.role === 'user' ? 'bg-blue-600 text-white' : msg.role === 'system' ? 'bg-amber-900/40 text-amber-200' : 'bg-slate-800 text-slate-100'">
+                  <template x-if="msg.role === 'agent'">
+                    <div class="markdown-body" x-html="renderMarkdown(msg.content)"></div>
+                  </template>
+                  <template x-if="msg.role !== 'agent'">
+                    <div x-text="msg.content"></div>
+                  </template>
+                  <template x-if="msg.files && msg.files.length > 0">
+                    <div class="mt-1 text-[10px] opacity-70">
+                      <template x-for="f in msg.files" :key="f.path">
+                        <span>📎 <span x-text="f.path"></span> </span>
+                      </template>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </template>
+
+            <!-- Loading indicator -->
+            <div x-show="agentStatus === 'thinking'" class="mr-auto">
+              <div class="bg-slate-800 rounded-lg px-3 py-2 text-sm text-slate-400">
+                Agent 正在思考...
+              </div>
+            </div>
+          </div>
+
+          <!-- Input -->
+          <div class="border-t border-slate-800 p-3">
+            <div class="flex items-end gap-2">
+              <textarea x-model="inputText" @keydown.enter.prevent="sendMessage()"
+                        placeholder="输入消息..."
+                        class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm resize-none focus:outline-none focus:border-blue-500"
+                        rows="2"></textarea>
+              <button @click="sendMessage()" :disabled="!inputText.trim() || agentStatus === 'thinking'"
+                      class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-sm font-medium">
+                发送
+              </button>
+            </div>
+            <div class="mt-2 flex items-center gap-2">
+              <button @click="submitWork()" x-show="!conversationSubmitted"
+                      class="text-[10px] px-2 py-1 rounded bg-emerald-700 hover:bg-emerald-600 text-white">
+                提交作业
+              </button>
+              <span x-show="conversationSubmitted" class="text-[10px] text-emerald-400">✓ 已提交</span>
+            </div>
+          </div>
+        </div>
+      </template>
+    </main>
+  </div>
+
+  <!-- Agent Picker Modal -->
+  <div x-show="showAgentPicker" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @click.self="showAgentPicker = false">
+    <div class="bg-slate-900 rounded-lg p-6 w-96 max-h-[80vh] overflow-y-auto">
+      <h3 class="text-sm font-semibold mb-4">选择 Agent</h3>
+      <template x-if="availableAgents.length === 0">
+        <div class="text-xs text-slate-500">加载中...</div>
+      </template>
+      <template x-for="agent in availableAgents" :key="agent.agent_id">
+        <button @click="createConversation(agent.agent_id)"
+                class="w-full text-left px-3 py-2 rounded hover:bg-slate-800 mb-1">
+          <div class="text-xs font-medium" x-text="agent.name"></div>
+          <div class="text-[10px] text-slate-500" x-text="agent.capabilities.join(', ')"></div>
+        </button>
+      </template>
+    </div>
+  </div>
+
+  <script>
+    function chatApp() {
+      return {
+        userEmail: '',
+        userRole: '',
+        conversations: [],
+        messages: [],
+        files: [],
+        availableAgents: [],
+        activeConvId: null,
+        inputText: '',
+        agentStatus: 'idle',
+        showAgentPicker: false,
+        conversationSubmitted: false,
+        wsConnected: false,
+        ws: null,
+        jwt: '',
+
+        async init() {
+          this.jwt = await this.getJwt()
+          if (!this.jwt) {
+            alert('未登录，请通过 Cloudflare Access 访问此页面')
+            return
+          }
+          try {
+            const payload = JSON.parse(atob(this.jwt.split('.')[1]))
+            this.userEmail = payload.email || ''
+            this.userRole = payload.role || ''
+          } catch (e) {}
+          await this.loadConversations()
+          await this.loadFiles()
+          this.connectWebSocket()
+        },
+
+        async getJwt() {
+          const meta = document.querySelector('meta[name="cf-access-jwt"]')
+          if (meta) return meta.content
+          return ''
+        },
+
+        async loadConversations() {
+          const resp = await fetch('/chat/conversations', {
+            headers: { 'Cf-Access-Jwt-Assertion': this.jwt }
+          })
+          if (resp.ok) this.conversations = await resp.json()
+        },
+
+        async loadFiles() {
+          const resp = await fetch('/chat/files?path=', {
+            headers: { 'Cf-Access-Jwt-Assertion': this.jwt }
+          })
+          if (resp.ok) this.files = await resp.json()
+        },
+
+        async loadAgents() {
+          const resp = await fetch('/chat/agents/available', {
+            headers: { 'Cf-Access-Jwt-Assertion': this.jwt }
+          })
+          if (resp.ok) this.availableAgents = await resp.json()
+        },
+
+        async selectConversation(id) {
+          this.activeConvId = id
+          const resp = await fetch(`/chat/conversations/${id}/messages`, {
+            headers: { 'Cf-Access-Jwt-Assertion': this.jwt }
+          })
+          if (resp.ok) this.messages = await resp.json()
+          this.scrollToBottom()
+          const conv = this.conversations.find(c => c.id === id)
+          this.conversationSubmitted = conv && conv.status === 'submitted'
+        },
+
+        async createConversation(agentId) {
+          this.showAgentPicker = false
+          await this.loadAgents()
+          const resp = await fetch('/chat/conversations', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Cf-Access-Jwt-Assertion': this.jwt
+            },
+            body: JSON.stringify({ agent_id: agentId })
+          })
+          if (resp.ok) {
+            const conv = await resp.json()
+            this.conversations.unshift(conv)
+            await this.selectConversation(conv.id)
+          }
+        },
+
+        async sendMessage() {
+          if (!this.inputText.trim() || !this.ws || this.agentStatus === 'thinking') return
+          const content = this.inputText.trim()
+          this.inputText = ''
+          this.messages.push({ id: 'opt-' + Date.now(), role: 'user', content, files: [] })
+          this.scrollToBottom()
+          this.ws.send(JSON.stringify({
+            type: 'chat_message',
+            conversation_id: this.activeConvId,
+            content: content,
+            files: []
+          }))
+        },
+
+        connectWebSocket() {
+          const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+          const url = `${proto}//${location.host}/chat/ws?token=${encodeURIComponent(this.jwt)}`
+          this.ws = new WebSocket(url)
+          this.ws.onopen = () => { this.wsConnected = true; this.loadAgents() }
+          this.ws.onclose = () => { this.wsConnected = false; setTimeout(() => this.connectWebSocket(), 3000) }
+          this.ws.onmessage = (e) => { this.handleWsMessage(JSON.parse(e.data)) }
+        },
+
+        handleWsMessage(msg) {
+          switch (msg.type) {
+            case 'message_ack': this.agentStatus = 'thinking'; break
+            case 'agent_status': this.agentStatus = msg.status; break
+            case 'agent_message':
+              this.messages.push({ id: msg.message_id, role: 'agent', content: msg.content, files: msg.files || [] })
+              this.scrollToBottom()
+              break
+          }
+        },
+
+        async submitWork() {
+          if (!this.activeConvId) return
+          const resp = await fetch(`/chat/conversations/${this.activeConvId}/submit`, {
+            method: 'POST',
+            headers: { 'Cf-Access-Jwt-Assertion': this.jwt }
+          })
+          if (resp.ok) { this.conversationSubmitted = true; alert('作业已提交') }
+        },
+
+        renderMarkdown(text) {
+          if (!text) return ''
+          return DOMPurify.sanitize(marked.parse(text))
+        },
+
+        scrollToBottom() {
+          this.$nextTick(() => {
+            const el = document.getElementById('messages')
+            if (el) el.scrollTop = el.scrollHeight
+          })
+        },
+
+        roleLabel(role) {
+          const labels = { pm: 'PM 组', developer: '开发组', hardware: '硬件组', sales: '销售/管理组' }
+          return labels[role] || role
+        }
+      }
+    }
+  </script>
+</body>
+</html>

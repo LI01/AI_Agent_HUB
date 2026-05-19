@@ -1833,3 +1833,7 @@ if WEB_DIR.exists():
         return FileResponse(WEB_DIR / "index.html", media_type="text/html")
 
     app.mount("/ui", StaticFiles(directory=str(WEB_DIR), html=False), name="ui")
+
+    @app.get("/chat")
+    def _chat_page():
+        return FileResponse(WEB_DIR / "chat.html", media_type="text/html")
