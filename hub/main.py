@@ -75,11 +75,6 @@ app.add_middleware(
 app.include_router(chat_router)
 app.include_router(admin_chat_router)
 
-
-@app.get("/chat/admin")
-async def chat_admin_page():
-    return FileResponse("web/chat_admin.html")
-
 registry = AgentRegistry()
 queue = TaskQueue()
 router = Router(registry, queue)
@@ -1825,7 +1820,7 @@ def get_admin_usage(
 # so a missing SPA bundle still produces a redirect from the root URL.
 @app.get("/")
 def _root():
-    return RedirectResponse("/ui/", status_code=307)
+    return RedirectResponse("/chat", status_code=307)
 
 
 WEB_DIR = pathlib.Path(__file__).resolve().parent.parent / "web"
@@ -1842,3 +1837,12 @@ if WEB_DIR.exists():
     @app.get("/chat")
     def _chat_page():
         return FileResponse(WEB_DIR / "chat.html", media_type="text/html")
+
+    @app.get("/chat/admin")
+    def _chat_admin_page():
+        return FileResponse(WEB_DIR / "chat_admin.html", media_type="text/html")
+
+    @app.get("/chat/jwt")
+    def _chat_jwt(cf_access_jwt: Optional[str] = Header(None, alias="Cf-Access-Jwt-Assertion")):
+        """Return the CF Access JWT to the frontend so it can authenticate WS/REST calls."""
+        return {"token": cf_access_jwt or ""}

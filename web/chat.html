@@ -187,8 +187,13 @@
         },
 
         async getJwt() {
-          const meta = document.querySelector('meta[name="cf-access-jwt"]')
-          if (meta) return meta.content
+          try {
+            const resp = await fetch('/chat/jwt')
+            if (resp.ok) {
+              const data = await resp.json()
+              return data.token || ''
+            }
+          } catch (e) {}
           return ''
         },
 
